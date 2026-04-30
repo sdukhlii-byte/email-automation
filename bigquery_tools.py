@@ -16,7 +16,6 @@ log = logging.getLogger(__name__)
 PROJECT   = "x-fabric-494718-d1"
 DATASET   = "datasetmailchimp"
 
-# Tables the agent is allowed to query
 ALLOWED_TABLES = {
     "EmailKnowledgeBase",
     "EmailEnrichment",
@@ -46,44 +45,75 @@ def get_bq_client() -> bigquery.Client:
 
 
 # ---------------------------------------------------------------------------
-# Schema helper — agent can call this to understand table structure
+# Schema — ALWAYS use table aliases to avoid ambiguous column resolution
 # ---------------------------------------------------------------------------
 def get_schema() -> str:
-    """Returns a compact schema description for the agent's context."""
     return """
 Available tables in x-fabric-494718-d1.datasetmailchimp:
 
-EmailKnowledgeBase (main table):
+EmailKnowledgeBase (alias: k) — main campaign table:
   campaign_id, CampaignTitle, SubjectLine, PreviewText, SendTime,
   ListName, EmailsSent, Opens_UniqueOpens, Clicks_UniqueClicks,
   Unsubscribed, open_rate_percent, ctr_percent, unsub_rate_percent, clean_text
 
-EmailEnrichment (GPT classifications, JOIN on campaign_id):
+EmailEnrichment (alias: e) — GPT classifications, JOIN on campaign_id:
   campaign_id, hook_type, offer_type, angle, language, geo,
   cta, tone, summary, reasoning, enriched_at
 
-Reports (raw Mailchimp metrics, JOIN on Id = campaign_id):
+Reports (alias: r) — raw Mailchimp metrics, JOIN on Id = campaign_id:
   Id, CampaignTitle, SubjectLine, SendTime, EmailsSent,
   Opens_OpenRate, Clicks_ClickRate, ListId
 
-Lists:
-  Id, Name
+Lists: Id, Name
 
-Example useful queries:
-  -- Top campaigns by open rate
-  SELECT SubjectLine, open_rate_percent, ctr_percent, hook_type, tone
-  FROM EmailKnowledgeBase k
-  JOIN EmailEnrichment e USING (campaign_id)
-  ORDER BY open_rate_percent DESC LIMIT 10
+CRITICAL RULES for query generation:
+1. ALWAYS use table aliases and prefix every column: k.SubjectLine, e.hook_type etc.
+   Never use bare column names — SubjectLine exists in both EmailKnowledgeBase
+   and Reports, so unqualified references return NULL or cause errors.
+2. Always use fully qualified table names:
+   `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase` k
+3. When joining, use: LEFT JOIN ... e USING (campaign_id) or ON k.campaign_id = e.campaign_id
+
+Correct example queries:
+
+  -- Top campaigns by open rate (CORRECT — all columns prefixed)
+  SELECT
+    k.SubjectLine,
+    k.open_rate_percent,
+    k.ctr_percent,
+    e.hook_type,
+    e.tone
+  FROM `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase` k
+  LEFT JOIN `x-fabric-494718-d1.datasetmailchimp.EmailEnrichment` e
+    ON k.campaign_id = e.campaign_id
+  WHERE k.SubjectLine IS NOT NULL
+  ORDER BY k.open_rate_percent DESC
+  LIMIT 10
 
   -- Performance by hook type
-  SELECT e.hook_type,
+  SELECT
+    e.hook_type,
     COUNT(*) as campaigns,
-    ROUND(AVG(k.open_rate_percent),2) as avg_open_rate,
-    ROUND(AVG(k.ctr_percent),2) as avg_ctr
-  FROM EmailKnowledgeBase k
-  JOIN EmailEnrichment e USING (campaign_id)
-  GROUP BY 1 ORDER BY avg_open_rate DESC
+    ROUND(AVG(k.open_rate_percent), 2) as avg_open_rate,
+    ROUND(AVG(k.ctr_percent), 2) as avg_ctr
+  FROM `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase` k
+  LEFT JOIN `x-fabric-494718-d1.datasetmailchimp.EmailEnrichment` e
+    ON k.campaign_id = e.campaign_id
+  WHERE e.hook_type IS NOT NULL
+  GROUP BY e.hook_type
+  ORDER BY avg_open_rate DESC
+
+  -- Campaigns by language
+  SELECT
+    e.language,
+    COUNT(*) as campaigns,
+    ROUND(AVG(k.open_rate_percent), 1) as avg_open_rate
+  FROM `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase` k
+  LEFT JOIN `x-fabric-494718-d1.datasetmailchimp.EmailEnrichment` e
+    ON k.campaign_id = e.campaign_id
+  WHERE e.language IS NOT NULL
+  GROUP BY e.language
+  ORDER BY campaigns DESC
 """.strip()
 
 
@@ -91,15 +121,10 @@ Example useful queries:
 # SQL execution
 # ---------------------------------------------------------------------------
 def run_sql(query: str, max_rows: int = 50) -> str:
-    """
-    Executes a BigQuery SQL query and returns results as a formatted string.
-    Only SELECT statements allowed. Max 50 rows returned to keep context tight.
-    """
     q = query.strip().upper()
     if not q.startswith("SELECT") and not q.startswith("WITH"):
         return "ERROR: Only SELECT queries are allowed."
 
-    # Basic injection guard — no DML
     for keyword in ("INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "MERGE", "TRUNCATE"):
         if keyword in q:
             return f"ERROR: {keyword} statements are not allowed."
@@ -108,17 +133,13 @@ def run_sql(query: str, max_rows: int = 50) -> str:
         client = get_bq_client()
         job_config = bigquery.QueryJobConfig(
             default_dataset=f"{PROJECT}.{DATASET}",
-            maximum_bytes_billed=100 * 1024 * 1024,  # 100 MB cap
+            maximum_bytes_billed=100 * 1024 * 1024,
         )
         rows = list(client.query(query, job_config=job_config).result())
 
         if not rows:
             return "Query returned 0 rows."
 
-        # Format as markdown table
-        fields = [f.name for f in rows[0].__class__._meta.fields] if hasattr(rows[0].__class__, '_meta') else list(rows[0].keys())
-        
-        # Get column names from first row
         cols = list(dict(rows[0]).keys())
         lines = ["| " + " | ".join(cols) + " |"]
         lines.append("| " + " | ".join(["---"] * len(cols)) + " |")
@@ -139,7 +160,7 @@ def run_sql(query: str, max_rows: int = 50) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool definition for OpenAI function calling
+# Tool spec
 # ---------------------------------------------------------------------------
 SQL_TOOL_SPEC = {
     "type": "function",
@@ -148,15 +169,15 @@ SQL_TOOL_SPEC = {
         "description": (
             "Runs a BigQuery SQL SELECT query against the Mailchimp email marketing database. "
             "Use for aggregations, rankings, trend analysis, filtering by metrics. "
-            "Always use fully qualified table names like `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase` "
-            "or rely on the default dataset. JOIN EmailEnrichment for hook_type, tone, geo, language."
+            "ALWAYS use table aliases and prefix every column (k.SubjectLine, e.hook_type). "
+            "Never use bare unqualified column names — they resolve to NULL on JOIN."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Valid BigQuery SQL SELECT statement.",
+                    "description": "Valid BigQuery SQL SELECT with fully qualified table names and aliased columns.",
                 }
             },
             "required": ["query"],
