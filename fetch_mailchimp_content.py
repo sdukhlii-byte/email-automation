@@ -1,19 +1,28 @@
 import os
 import json
 import requests
+import time
+
 from datetime import datetime, timezone
 
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
+# =========================
+# CONFIG
+# =========================
 PROJECT_ID = "x-fabric-494718-d1"
 DATASET = "datasetmailchimp"
+
 REPORTS_TABLE = f"{PROJECT_ID}.{DATASET}.Reports"
 CONTENT_TABLE = f"{PROJECT_ID}.{DATASET}.CampaignContentsRaw"
 
 MAILCHIMP_API_KEY = os.environ["MAILCHIMP_API_KEY"]
 SERVER_PREFIX = MAILCHIMP_API_KEY.split("-")[-1]
 
+# =========================
+# BIGQUERY CLIENT
+# =========================
 credentials_info = json.loads(os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"])
 credentials = service_account.Credentials.from_service_account_info(credentials_info)
 
@@ -22,6 +31,9 @@ client = bigquery.Client(
     project=PROJECT_ID
 )
 
+# =========================
+# GET CAMPAIGNS
+# =========================
 def get_campaign_ids():
     query = f"""
     SELECT DISTINCT Id
@@ -34,29 +46,49 @@ def get_campaign_ids():
     """
     return [row.Id for row in client.query(query).result()]
 
-def fetch_campaign_content(campaign_id):
+# =========================
+# FETCH CONTENT (с retry)
+# =========================
+def fetch_campaign_content(campaign_id, retries=3):
     url = f"https://{SERVER_PREFIX}.api.mailchimp.com/3.0/campaigns/{campaign_id}/content"
 
-    response = requests.get(
-        url,
-        auth=("anystring", MAILCHIMP_API_KEY),
-        timeout=30
-    )
+    for attempt in range(retries):
+        try:
+            response = requests.get(
+                url,
+                auth=("anystring", MAILCHIMP_API_KEY),
+                timeout=30
+            )
 
-    if response.status_code != 200:
-        print(f"Error {response.status_code} for {campaign_id}: {response.text[:300]}")
-        return None
+            # RATE LIMIT
+            if response.status_code == 429:
+                print(f"429 rate limit for {campaign_id}, retrying...")
+                time.sleep(2)
+                continue
 
-    data = response.json()
+            if response.status_code != 200:
+                print(f"Error {response.status_code} for {campaign_id}: {response.text[:200]}")
+                return None
 
-    return {
-        "campaign_id": campaign_id,
-        "html_content": data.get("html"),
-        "plain_text_content": data.get("plain_text"),
-        "archive_html": data.get("archive_html"),
-        "fetched_at": datetime.now(timezone.utc).isoformat()
-    }
+            data = response.json()
 
+            return {
+                "campaign_id": campaign_id,
+                "html_content": data.get("html"),
+                "plain_text_content": data.get("plain_text"),
+                "archive_html": data.get("archive_html"),
+                "fetched_at": datetime.now(timezone.utc)
+            }
+
+        except Exception as e:
+            print(f"Exception for {campaign_id}: {str(e)}")
+            time.sleep(2)
+
+    return None
+
+# =========================
+# INSERT INTO BQ
+# =========================
 def insert_rows(rows):
     if not rows:
         return
@@ -64,13 +96,16 @@ def insert_rows(rows):
     errors = client.insert_rows_json(CONTENT_TABLE, rows)
 
     if errors:
-        print("BigQuery insert errors:", errors)
+        print("❌ BigQuery insert errors:", errors)
     else:
-        print(f"Inserted {len(rows)} rows")
+        print(f"✅ Inserted {len(rows)} rows")
 
+# =========================
+# MAIN
+# =========================
 def main():
     campaign_ids = get_campaign_ids()
-    print(f"Campaigns to fetch: {len(campaign_ids)}")
+    print(f"🚀 Campaigns to fetch: {len(campaign_ids)}")
 
     rows = []
 
@@ -80,14 +115,21 @@ def main():
         if content:
             rows.append(content)
 
+        # 👉 RATE LIMIT (ВАЖНО)
+        time.sleep(0.2)
+
+        # 👉 батч вставка
         if len(rows) >= 100:
             insert_rows(rows)
             rows = []
 
         print(f"{i}/{len(campaign_ids)} done")
 
+    # остаток
     insert_rows(rows)
-    print("Done")
 
+    print("🎯 DONE")
+
+# =========================
 if __name__ == "__main__":
     main()
