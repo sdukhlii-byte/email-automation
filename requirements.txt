@@ -1,7 +1,7 @@
-beautifulsoup4
-streamlit
-openai
-pandas
+beautifulsoup4>=4.12.0
+streamlit>=1.35.0
+openai>=1.30.0
+pandas>=2.0.0
 google-cloud-bigquery==3.25.0
 google-auth==2.35.0
 requests==2.32.3
