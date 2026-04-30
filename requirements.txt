@@ -5,3 +5,4 @@ beautifulsoup4
 streamlit
 openai
 pandas
+qdrant-client==1.11.3
