@@ -256,6 +256,71 @@ textarea[data-testid="stChatInputTextArea"]:focus {
 ::-webkit-scrollbar { width:4px; height:4px; }
 ::-webkit-scrollbar-thumb { background:var(--border2); border-radius:2px; }
 ::-webkit-scrollbar-track { background:transparent; }
+
+/* DATA CONTEXT PANEL */
+.ctx-panel {
+  margin: 10px 16px 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  overflow: hidden;
+}
+.ctx-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 14px; cursor: pointer; user-select: none;
+  background: var(--surface2);
+  border-bottom: 1px solid transparent;
+  transition: border-color .15s;
+}
+.ctx-header:hover { background: #f3f1ed; }
+.ctx-header.open { border-bottom-color: var(--border); }
+.ctx-header-left { display: flex; align-items: center; gap: 8px; }
+.ctx-icon {
+  width: 22px; height: 22px;
+  background: var(--blue-bg); border-radius: 6px;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 11px; color: var(--blue); border: 1px solid #c7d2fe;
+}
+.ctx-title { font-size: 12px; font-weight: 600; color: var(--text); }
+.ctx-hint { font-size: 11px; color: var(--text3); }
+.ctx-arrow { font-size: 10px; color: var(--text3); transition: transform .2s; }
+.ctx-arrow.open { transform: rotate(180deg); }
+
+.ctx-body { padding: 12px 14px; display: none; }
+.ctx-body.open { display: block; }
+
+.ctx-grid { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
+@media(max-width:640px){ .ctx-grid{ grid-template-columns:1fr; } }
+
+.ctx-section { }
+.ctx-section-title {
+  font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .07em; margin-bottom: 7px;
+}
+.ctx-section-title.green { color: var(--green); }
+.ctx-section-title.red   { color: #dc2626; }
+.ctx-section-title.blue  { color: var(--blue); }
+
+.ctx-item {
+  display: flex; align-items: flex-start; gap: 6px;
+  font-size: 11px; color: var(--text2); line-height: 1.45;
+  padding: 3px 0;
+}
+.ctx-dot { width: 5px; height: 5px; border-radius: 50%; flex-shrink: 0; margin-top: 5px; }
+.dot-green { background: var(--green2); }
+.dot-red   { background: #ef4444; }
+.dot-blue  { background: var(--blue); }
+
+.ctx-sep { height: 1px; background: var(--border); margin: 10px 0; }
+
+.hypo-chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 2px; }
+.hypo-chip {
+  font-size: 10px; color: var(--blue); background: var(--blue-bg);
+  border: 1px solid #c7d2fe; border-radius: 20px;
+  padding: 3px 9px; cursor: pointer; transition: all .15s;
+  font-weight: 500;
+}
+.hypo-chip:hover { background: #dde5fb; border-color: var(--blue); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -498,6 +563,89 @@ if st.session_state.last_df is not None:
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_xlsx")
         except ImportError: pass
     st.markdown('</div>', unsafe_allow_html=True)
+
+
+# ─── DATA CONTEXT PANEL ────────────────────────────────────────────────────
+st.markdown('<hr class="ei-div">', unsafe_allow_html=True)
+st.markdown("""
+<div class="ctx-panel">
+  <div class="ctx-header" id="ctx-hdr" onclick="toggleCtx()" >
+    <div class="ctx-header-left">
+      <div class="ctx-icon">𝌞</div>
+      <div>
+        <div class="ctx-title">What's in this data?</div>
+      </div>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;">
+      <span class="ctx-hint">Mailchimp → BigQuery · no revenue data</span>
+      <span class="ctx-arrow" id="ctx-arrow">▼</span>
+    </div>
+  </div>
+  <div class="ctx-body" id="ctx-body">
+    <div class="ctx-grid">
+
+      <div class="ctx-section">
+        <div class="ctx-section-title green">✓ Available data</div>
+        <div class="ctx-item"><div class="ctx-dot dot-green"></div>1 652 email campaigns from Mailchimp</div>
+        <div class="ctx-item"><div class="ctx-dot dot-green"></div>Open rate &amp; CTR per campaign</div>
+        <div class="ctx-item"><div class="ctx-dot dot-green"></div>Hook type (Curiosity, Urgency, Gift…) — GPT-classified</div>
+        <div class="ctx-item"><div class="ctx-dot dot-green"></div>Tone (Casual, Informational, Playful…)</div>
+        <div class="ctx-item"><div class="ctx-dot dot-green"></div>Language (EN, RU, LT, ES, PL)</div>
+        <div class="ctx-item"><div class="ctx-dot dot-green"></div>Subject line text &amp; preview</div>
+        <div class="ctx-item"><div class="ctx-dot dot-green"></div>Send date &amp; campaign name</div>
+      </div>
+
+      <div class="ctx-section">
+        <div class="ctx-section-title red">✗ Not available</div>
+        <div class="ctx-item"><div class="ctx-dot dot-red"></div>Revenue / GMV — needs affiliate data separately</div>
+        <div class="ctx-item"><div class="ctx-dot dot-red"></div>Unsubscribe &amp; bounce rates</div>
+        <div class="ctx-item"><div class="ctx-dot dot-red"></div>Individual recipient behaviour</div>
+        <div class="ctx-item"><div class="ctx-dot dot-red"></div>A/B test variants</div>
+        <div class="ctx-item"><div class="ctx-dot dot-red"></div>Segment / audience breakdown</div>
+        <div class="ctx-item"><div class="ctx-dot dot-red"></div>Send-time optimisation data</div>
+      </div>
+
+      <div class="ctx-section">
+        <div class="ctx-section-title blue">⚡ Hypotheses to explore</div>
+        <div class="hypo-chips">
+          <span class="hypo-chip" onclick="sendHypo('Does curiosity hook outperform urgency across all languages?')">Curiosity vs Urgency by language</span>
+          <span class="hypo-chip" onclick="sendHypo('Which tone has the highest CTR — casual or informational?')">Tone → CTR</span>
+          <span class="hypo-chip" onclick="sendHypo('Show open rate trend over time — are results improving?')">Open rate trend</span>
+          <span class="hypo-chip" onclick="sendHypo('What subject line patterns appear in top 50 campaigns by open rate?')">Top subject patterns</span>
+          <span class="hypo-chip" onclick="sendHypo('Compare performance of discount vs gift hook types')">Discount vs Gift</span>
+          <span class="hypo-chip" onclick="sendHypo('Which language audience responds best to urgency emails?')">Language × Hook</span>
+          <span class="hypo-chip" onclick="sendHypo('Show me campaigns with open rate above 50% — what do they have in common?')">50%+ open rate</span>
+          <span class="hypo-chip" onclick="sendHypo('Is there a correlation between subject line length and open rate?')">Subject length → open</span>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<script>
+function toggleCtx() {
+  var body = document.getElementById('ctx-body');
+  var arrow = document.getElementById('ctx-arrow');
+  var hdr = document.getElementById('ctx-hdr');
+  var isOpen = body.classList.contains('open');
+  body.classList.toggle('open', !isOpen);
+  arrow.classList.toggle('open', !isOpen);
+  hdr.classList.toggle('open', !isOpen);
+}
+function sendHypo(text) {
+  // Find Streamlit chat input and inject text
+  var inputs = window.parent.document.querySelectorAll('textarea[data-testid="stChatInputTextArea"]');
+  if (inputs.length > 0) {
+    var inp = inputs[0];
+    var nativeInputValueSetter = Object.getOwnPropertyDescriptor(window.parent.HTMLTextAreaElement.prototype, 'value').set;
+    nativeInputValueSetter.call(inp, text);
+    inp.dispatchEvent(new Event('input', { bubbles: true }));
+    inp.focus();
+  }
+}
+</script>
+""", unsafe_allow_html=True)
 
 
 # ─── CHAT ──────────────────────────────────────────────────────────────────
