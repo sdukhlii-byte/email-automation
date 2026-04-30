@@ -1,9 +1,3 @@
-"""
-Mailchimp Campaign Enrichment Worker
-Reads campaigns from BigQuery, classifies them via LLM, writes results back.
-Designed to run as a Railway batch worker (no web server).
-"""
-
 import json
 import logging
 import os
