@@ -1,7 +1,10 @@
 import os
+import json
 import requests
 from datetime import datetime, timezone
+
 from google.cloud import bigquery
+from google.oauth2 import service_account
 
 PROJECT_ID = "x-fabric-494718-d1"
 DATASET = "datasetmailchimp"
@@ -9,9 +12,15 @@ REPORTS_TABLE = f"{PROJECT_ID}.{DATASET}.Reports"
 CONTENT_TABLE = f"{PROJECT_ID}.{DATASET}.CampaignContentsRaw"
 
 MAILCHIMP_API_KEY = os.environ["MAILCHIMP_API_KEY"]
-SERVER_PREFIX = MAILCHIMP_API_KEY.split("-")[-1]  # например us10
+SERVER_PREFIX = MAILCHIMP_API_KEY.split("-")[-1]
 
-client = bigquery.Client(project=PROJECT_ID)
+credentials_info = json.loads(os.environ["GOOGLE_APPLICATION_CREDENTIALS_JSON"])
+credentials = service_account.Credentials.from_service_account_info(credentials_info)
+
+client = bigquery.Client(
+    credentials=credentials,
+    project=PROJECT_ID
+)
 
 def get_campaign_ids():
     query = f"""
@@ -19,7 +28,8 @@ def get_campaign_ids():
     FROM `{REPORTS_TABLE}`
     WHERE Id IS NOT NULL
       AND Id NOT IN (
-        SELECT campaign_id FROM `{CONTENT_TABLE}`
+        SELECT campaign_id
+        FROM `{CONTENT_TABLE}`
       )
     """
     return [row.Id for row in client.query(query).result()]
@@ -47,6 +57,17 @@ def fetch_campaign_content(campaign_id):
         "fetched_at": datetime.now(timezone.utc).isoformat()
     }
 
+def insert_rows(rows):
+    if not rows:
+        return
+
+    errors = client.insert_rows_json(CONTENT_TABLE, rows)
+
+    if errors:
+        print("BigQuery insert errors:", errors)
+    else:
+        print(f"Inserted {len(rows)} rows")
+
 def main():
     campaign_ids = get_campaign_ids()
     print(f"Campaigns to fetch: {len(campaign_ids)}")
@@ -60,21 +81,13 @@ def main():
             rows.append(content)
 
         if len(rows) >= 100:
-            errors = client.insert_rows_json(CONTENT_TABLE, rows)
-            if errors:
-                print(errors)
-            else:
-                print(f"Inserted {len(rows)} rows")
+            insert_rows(rows)
             rows = []
 
         print(f"{i}/{len(campaign_ids)} done")
 
-    if rows:
-        errors = client.insert_rows_json(CONTENT_TABLE, rows)
-        if errors:
-            print(errors)
-        else:
-            print(f"Inserted final {len(rows)} rows")
+    insert_rows(rows)
+    print("Done")
 
 if __name__ == "__main__":
     main()
