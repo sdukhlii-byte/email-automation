@@ -1,8 +1,8 @@
-google-cloud-bigquery
-google-auth
-requests
 beautifulsoup4
 streamlit
 openai
 pandas
+google-cloud-bigquery==3.25.0
+google-auth==2.35.0
+requests==2.32.3
 qdrant-client==1.11.3
