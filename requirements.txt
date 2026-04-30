@@ -2,3 +2,6 @@ google-cloud-bigquery
 google-auth
 requests
 beautifulsoup4
+streamlit
+openai
+pandas
