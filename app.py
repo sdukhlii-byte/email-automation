@@ -1,8 +1,10 @@
 """
-Email Marketing Intelligence — Streamlit UI
-Clean minimalist design, Notion/Linear aesthetic
+Email Marketing Intelligence — Professional Dashboard
+Warm editorial design · Dashboard + AI Chat · Export
 """
 
+import io
+import json
 import logging
 import os
 import streamlit as st
@@ -13,521 +15,479 @@ st.set_page_config(
     page_title="Email Intelligence",
     page_icon="✉",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 st.markdown("""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600&family=Geist+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,300&family=DM+Mono:wght@400;500&display=swap');
+
+:root {
+  --bg:        #f7f6f3;
+  --surface:   #ffffff;
+  --border:    #e8e4dc;
+  --border2:   #d4cfc4;
+  --text:      #1c1917;
+  --text2:     #78716c;
+  --text3:     #a8a29e;
+  --accent:    #4f46e5;
+  --accent-bg: #eef2ff;
+  --green:     #16a34a;
+  --green-bg:  #f0fdf4;
+  --amber:     #d97706;
+  --amber-bg:  #fffbeb;
+  --red:       #dc2626;
+  --mono:      'DM Mono', monospace;
+  --sans:      'DM Sans', sans-serif;
+  --radius:    10px;
+  --shadow:    0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
+  --shadow-md: 0 4px 12px rgba(0,0,0,0.08), 0 2px 4px rgba(0,0,0,0.04);
+}
 
 *, html, body, [class*="css"] {
-    font-family: 'Geist', -apple-system, sans-serif !important;
-    -webkit-font-smoothing: antialiased;
+  font-family: var(--sans) !important;
+  -webkit-font-smoothing: antialiased;
 }
+.stApp { background: var(--bg) !important; }
+#MainMenu, footer, header, [data-testid="stToolbar"],
+[data-testid="collapsedControl"] { visibility: hidden; height: 0; }
+.main .block-container { padding: 0 !important; max-width: 100% !important; }
 
-/* ── Base ── */
-.stApp { background: #ffffff; color: #1a1a1a; }
+.topnav {
+  background: var(--surface); border-bottom: 1px solid var(--border);
+  padding: 0 32px; height: 56px;
+  display: flex; align-items: center; justify-content: space-between;
+  box-shadow: var(--shadow);
+}
+.nav-brand { display: flex; align-items: center; gap: 10px; }
+.nav-logo {
+  width: 32px; height: 32px; background: var(--accent);
+  border-radius: 8px; display: flex; align-items: center;
+  justify-content: center; color: white; font-size: 16px;
+}
+.nav-title { font-size: 15px; font-weight: 600; color: var(--text); letter-spacing: -0.02em; }
+.nav-subtitle { font-size: 12px; color: var(--text3); }
+.nav-pill {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px; padding: 4px 12px; border-radius: 20px;
+  border: 1px solid #bbf7d0; background: var(--green-bg); color: var(--green);
+}
+.nav-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); }
 
-/* ── Sidebar ── */
-section[data-testid="stSidebar"] {
-    background: #fafafa !important;
-    border-right: 1px solid #e5e5e5 !important;
-    padding-top: 0 !important;
-}
-section[data-testid="stSidebar"] > div { padding: 20px 16px; }
+.page-body { padding: 28px 32px 120px 32px; max-width: 1200px; margin: 0 auto; }
 
-/* ── Sidebar text ── */
-section[data-testid="stSidebar"] label,
-section[data-testid="stSidebar"] .stSelectbox label,
-section[data-testid="stSidebar"] p,
-section[data-testid="stSidebar"] span {
-    color: #6b7280 !important;
-    font-size: 12px !important;
-    font-weight: 500 !important;
-    letter-spacing: 0.02em;
-    text-transform: uppercase;
+.kpi-grid { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; margin-bottom: 28px; }
+.kpi-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 20px 22px; box-shadow: var(--shadow);
+  transition: box-shadow 0.15s;
 }
-section[data-testid="stSidebar"] .stSelectbox > div > div {
-    background: #fff !important;
-    border: 1px solid #e5e5e5 !important;
-    border-radius: 8px !important;
-    color: #1a1a1a !important;
-    font-size: 13px !important;
-    font-weight: 400 !important;
-    text-transform: none !important;
-    letter-spacing: 0 !important;
-}
-section[data-testid="stSidebar"] .stSlider { margin-top: 4px; }
+.kpi-card:hover { box-shadow: var(--shadow-md); }
+.kpi-val { font-family: var(--mono); font-size: 26px; font-weight: 500; color: var(--text); letter-spacing: -0.03em; line-height: 1; margin-bottom: 6px; }
+.kpi-lbl { font-size: 11px; font-weight: 600; color: var(--text3); text-transform: uppercase; letter-spacing: 0.07em; }
+.kpi-delta { display: inline-block; font-size: 11px; font-weight: 500; margin-top: 6px; padding: 2px 7px; border-radius: 4px; }
+.d-up  { background: var(--green-bg); color: var(--green); }
+.d-neu { background: var(--amber-bg); color: var(--amber); }
 
-/* ── Main area padding ── */
-.main .block-container { padding: 32px 40px 80px 40px; max-width: 900px; }
+.chart-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 20px 22px;
+  box-shadow: var(--shadow); margin-bottom: 12px;
+}
+.sec-hd { display: flex; align-items: baseline; gap: 8px; margin-bottom: 14px; }
+.sec-title { font-size: 13px; font-weight: 600; color: var(--text); }
+.sec-sub   { font-size: 12px; color: var(--text3); }
 
-/* ── Chat messages ── */
-.stChatMessage {
-    background: transparent !important;
-    border: none !important;
-    padding: 0 !important;
-    margin-bottom: 24px !important;
-}
+.divider { border: none; border-top: 1px solid var(--border); margin: 28px 0; }
 
-/* ── User bubble ── */
-[data-testid="stChatMessageContent"] {
-    font-size: 14px !important;
-    line-height: 1.7 !important;
-    color: #1a1a1a !important;
+.msg-user {
+  background: var(--accent-bg); border: 1px solid #c7d2fe;
+  border-radius: var(--radius); padding: 12px 16px;
+  font-size: 14px; color: var(--text); line-height: 1.6; margin-bottom: 6px;
 }
+.msg-bot {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 16px 20px;
+  font-size: 14px; color: var(--text); line-height: 1.7;
+  margin-bottom: 6px; box-shadow: var(--shadow);
+}
+.badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-family: var(--mono); font-size: 10px; font-weight: 500;
+  padding: 2px 8px; border-radius: 4px; margin-right: 6px; margin-bottom: 8px;
+}
+.b-sql { background: var(--accent-bg); color: var(--accent); border: 1px solid #c7d2fe; }
+.b-rag { background: var(--green-bg);  color: var(--green);  border: 1px solid #bbf7d0; }
 
-/* ── Chat input ── */
-.stChatInputContainer {
-    background: #fff !important;
-    border-top: 1px solid #e5e5e5 !important;
-    padding: 12px 40px !important;
-}
-textarea[data-testid="stChatInputTextArea"] {
-    background: #fafafa !important;
-    border: 1px solid #e5e5e5 !important;
-    border-radius: 10px !important;
-    color: #1a1a1a !important;
-    font-family: 'Geist', sans-serif !important;
-    font-size: 14px !important;
-    padding: 10px 14px !important;
-}
-textarea[data-testid="stChatInputTextArea"]:focus {
-    border-color: #1a1a1a !important;
-    box-shadow: none !important;
-    outline: none !important;
-}
-
-/* ── Metric cards ── */
-.metric-row { display: flex; gap: 12px; margin-bottom: 32px; }
-.metric-card {
-    flex: 1;
-    background: #fafafa;
-    border: 1px solid #e5e5e5;
-    border-radius: 10px;
-    padding: 16px 20px;
-}
-.metric-val {
-    font-family: 'Geist Mono', monospace;
-    font-size: 22px;
-    font-weight: 500;
-    color: #1a1a1a;
-    letter-spacing: -0.02em;
-    line-height: 1;
-}
-.metric-lbl {
-    font-size: 11px;
-    color: #9ca3af;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    margin-top: 6px;
-    font-weight: 500;
-}
-
-/* ── Section label ── */
-.section-label {
-    font-size: 11px;
-    font-weight: 600;
-    color: #9ca3af;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    margin-bottom: 10px;
-}
-
-/* ── Suggestion chips ── */
-.chip-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 32px; }
-.chip {
-    background: #fff;
-    border: 1px solid #e5e5e5;
-    border-radius: 100px;
-    padding: 6px 14px;
-    font-size: 13px;
-    color: #374151;
-    cursor: pointer;
-    transition: all 0.12s;
-    white-space: nowrap;
-}
-.chip:hover { border-color: #1a1a1a; color: #1a1a1a; background: #f9f9f9; }
-
-/* ── Tool badge ── */
-.tool-badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    font-family: 'Geist Mono', monospace;
-    font-size: 10px;
-    font-weight: 500;
-    padding: 2px 8px;
-    border-radius: 4px;
-    margin-right: 6px;
-    margin-bottom: 10px;
-    vertical-align: middle;
-}
-.badge-sql { background: #eff6ff; color: #3b82f6; border: 1px solid #dbeafe; }
-.badge-rag { background: #f0fdf4; color: #16a34a; border: 1px solid #dcfce7; }
-
-/* ── Thinking indicator ── */
-.thinking {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    color: #9ca3af;
-    font-size: 13px;
-}
-.dot {
-    width: 5px; height: 5px; border-radius: 50%;
-    background: #d1d5db;
-    animation: pulse 1.2s ease-in-out infinite;
-}
+.thinking { display: flex; align-items: center; gap: 8px; color: var(--text3); font-size: 13px; padding: 8px 0; }
+.dot { width: 5px; height: 5px; border-radius: 50%; background: var(--border2); animation: blink 1.2s ease-in-out infinite; }
 .dot:nth-child(2) { animation-delay: 0.2s; }
 .dot:nth-child(3) { animation-delay: 0.4s; }
-@keyframes pulse {
-    0%, 80%, 100% { opacity: 0.3; transform: scale(0.8); }
-    40% { opacity: 1; transform: scale(1); }
-}
+@keyframes blink { 0%,80%,100%{opacity:.3;transform:scale(.8);} 40%{opacity:1;transform:scale(1);} }
 
-/* ── Divider ── */
-hr { border: none; border-top: 1px solid #f3f4f6; margin: 20px 0; }
-
-/* ── Streamlit button override for suggestion chips ── */
 .stButton > button {
-    background: #fff !important;
-    border: 1px solid #e5e5e5 !important;
-    border-radius: 100px !important;
-    color: #374151 !important;
-    font-size: 13px !important;
-    font-weight: 400 !important;
-    padding: 5px 16px !important;
-    transition: all 0.12s !important;
-    white-space: nowrap !important;
-    width: auto !important;
+  background: var(--surface) !important; border: 1px solid var(--border) !important;
+  border-radius: 20px !important; color: var(--text2) !important;
+  font-size: 13px !important; font-weight: 400 !important;
+  padding: 5px 14px !important; transition: all 0.12s !important;
+  white-space: nowrap !important; width: auto !important; box-shadow: none !important;
 }
 .stButton > button:hover {
-    border-color: #1a1a1a !important;
-    color: #1a1a1a !important;
-    background: #fafafa !important;
+  border-color: var(--accent) !important; color: var(--accent) !important;
+  background: var(--accent-bg) !important;
+}
+.btn-flat > button {
+  border-radius: 8px !important; font-size: 12px !important; color: var(--text2) !important;
 }
 
-/* ── Clear button ── */
-.clear-btn > button {
-    background: transparent !important;
-    border: 1px solid #e5e5e5 !important;
-    border-radius: 8px !important;
-    color: #9ca3af !important;
-    font-size: 12px !important;
-    width: 100% !important;
+.stChatInputContainer {
+  background: var(--surface) !important; border-top: 1px solid var(--border) !important;
+  padding: 12px 32px !important; position: fixed !important;
+  bottom: 0 !important; left: 0 !important; right: 0 !important;
+  z-index: 99 !important; box-shadow: 0 -4px 20px rgba(0,0,0,0.06) !important;
 }
-.clear-btn > button:hover {
-    border-color: #ef4444 !important;
-    color: #ef4444 !important;
+textarea[data-testid="stChatInputTextArea"] {
+  background: var(--bg) !important; border: 1px solid var(--border) !important;
+  border-radius: var(--radius) !important; color: var(--text) !important;
+  font-family: var(--sans) !important; font-size: 14px !important; padding: 10px 14px !important;
+  max-width: 860px !important; margin: 0 auto !important; display: block !important;
+}
+textarea[data-testid="stChatInputTextArea"]:focus {
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 0 3px rgba(79,70,229,0.1) !important; outline: none !important;
 }
 
-/* ── Markdown tables ── */
-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 13px;
-    margin-top: 8px;
-    border-radius: 8px;
-    overflow: hidden;
-    border: 1px solid #e5e5e5;
-}
-thead tr { background: #fafafa; }
-th {
-    text-align: left;
-    padding: 10px 14px;
-    font-size: 11px;
-    font-weight: 600;
-    color: #9ca3af;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
-    border-bottom: 1px solid #e5e5e5;
-}
-td {
-    padding: 10px 14px;
-    border-bottom: 1px solid #f3f4f6;
-    color: #374151;
-    vertical-align: top;
-    max-width: 280px;
-}
+table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 4px; }
+thead tr { background: var(--bg); }
+th { text-align: left; padding: 9px 14px; font-size: 11px; font-weight: 600; color: var(--text3); text-transform: uppercase; letter-spacing: 0.06em; border-bottom: 1px solid var(--border); }
+td { padding: 9px 14px; border-bottom: 1px solid var(--bg); color: var(--text); vertical-align: top; }
+tr:hover td { background: var(--bg); }
 tr:last-child td { border-bottom: none; }
-tr:hover td { background: #fafafa; }
 
-/* ── Scrollbar ── */
+.stSelectbox > div > div {
+  background: var(--surface) !important; border: 1px solid var(--border) !important;
+  border-radius: 8px !important; font-size: 13px !important; color: var(--text) !important;
+}
 ::-webkit-scrollbar { width: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
-::-webkit-scrollbar-thumb { background: #e5e5e5; border-radius: 2px; }
-::-webkit-scrollbar-thumb:hover { background: #d1d5db; }
-
-/* ── Status dot ── */
-.status { display: flex; align-items: center; gap: 6px; font-size: 12px; color: #6b7280; }
-.status-dot-green {
-    width: 6px; height: 6px; border-radius: 50%;
-    background: #22c55e; flex-shrink: 0;
-}
-.status-dot-red {
-    width: 6px; height: 6px; border-radius: 50%;
-    background: #ef4444; flex-shrink: 0;
-}
-
-/* ── User message box ── */
-.user-msg {
-    background: #f9fafb;
-    border: 1px solid #e5e5e5;
-    border-radius: 10px;
-    padding: 12px 16px;
-    font-size: 14px;
-    color: #1a1a1a;
-    line-height: 1.6;
-    margin-bottom: 4px;
-}
-
-/* hide streamlit branding */
-#MainMenu, footer, header { visibility: hidden; }
+::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 2px; }
 </style>
 """, unsafe_allow_html=True)
 
 
-# ── Session state ──────────────────────────────────────────────────────────
-if "history" not in st.session_state:
-    st.session_state.history = []
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# ── State ──────────────────────────────────────────────────────────────────
+if "history"  not in st.session_state: st.session_state.history  = []
+if "messages" not in st.session_state: st.session_state.messages = []
+if "last_df"  not in st.session_state: st.session_state.last_df  = None
 
-
-# ── Env check ─────────────────────────────────────────────────────────────
 REQUIRED = ["OPENAI_API_KEY", "QDRANT_URL", "QDRANT_API_KEY"]
-missing = [v for v in REQUIRED if not os.environ.get(v)]
+missing  = [v for v in REQUIRED if not os.environ.get(v)]
 
 
-# ── Sidebar ────────────────────────────────────────────────────────────────
-with st.sidebar:
-    # Logo / title
-    st.markdown("""
-    <div style="padding: 8px 0 20px 0; border-bottom: 1px solid #e5e5e5; margin-bottom: 20px;">
-        <div style="font-size: 15px; font-weight: 600; color: #1a1a1a; letter-spacing: -0.02em;">
-            ✉ Email Intelligence
-        </div>
-        <div style="font-size: 12px; color: #9ca3af; margin-top: 3px;">
-            Mailchimp campaign analysis
-        </div>
+# ── Nav ────────────────────────────────────────────────────────────────────
+pill = ('<div class="nav-pill"><div class="nav-dot"></div>Live</div>' if not missing
+        else '<div class="nav-pill" style="background:#fef2f2;border-color:#fecaca;color:#dc2626;"><div class="nav-dot" style="background:#dc2626"></div>Setup needed</div>')
+
+st.markdown(f"""
+<div class="topnav">
+  <div class="nav-brand">
+    <div class="nav-logo">✉</div>
+    <div>
+      <div class="nav-title">Email Intelligence</div>
+      <div class="nav-subtitle">Mailchimp · BigQuery · AI</div>
     </div>
-    """, unsafe_allow_html=True)
-
-    # Connection status
-    if missing:
-        st.markdown(f"""
-        <div class="status">
-            <div class="status-dot-red"></div>
-            Missing: {', '.join(missing)}
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown("""
-        <div class="status">
-            <div class="status-dot-green"></div>
-            BigQuery · Qdrant · OpenAI
-        </div>
-        """, unsafe_allow_html=True)
-
-    st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
-
-    # Model
-    st.markdown('<div class="section-label">Model</div>', unsafe_allow_html=True)
-    model = st.selectbox(
-        "model", ["gpt-4o-mini", "gpt-4o"],
-        index=0, label_visibility="collapsed"
-    )
-    os.environ["AGENT_MODEL"] = model
-
-    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-    st.markdown('<div style="border-top:1px solid #e5e5e5; margin-bottom:16px;"></div>', unsafe_allow_html=True)
-
-    # Filters
-    st.markdown('<div class="section-label">Filters for semantic search</div>', unsafe_allow_html=True)
-
-    filter_hook = st.selectbox(
-        "Hook type", ["Any", "curiosity", "urgency", "social-proof",
-                      "fear-of-missing-out", "story", "discount", "question"],
-        index=0, label_visibility="visible"
-    )
-    filter_tone = st.selectbox(
-        "Tone", ["Any", "casual", "formal", "playful", "urgent",
-                 "inspirational", "informational"],
-        index=0, label_visibility="visible"
-    )
-    filter_lang = st.selectbox(
-        "Language", ["Any", "en", "lt", "ru", "es", "pl"],
-        index=0, label_visibility="visible"
-    )
-    min_open = st.slider("Min open rate %", 0, 100, 0)
-
-    st.session_state.sidebar_filters = {
-        k: v for k, v in {
-            "hook_type": None if filter_hook == "Any" else filter_hook,
-            "tone": None if filter_tone == "Any" else filter_tone,
-            "language": None if filter_lang == "Any" else filter_lang,
-            "min_open_rate": min_open if min_open > 0 else None,
-        }.items() if v is not None
-    }
-
-    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-    st.markdown('<div style="border-top:1px solid #e5e5e5; margin-bottom:16px;"></div>', unsafe_allow_html=True)
-
-    with st.container():
-        st.markdown('<div class="clear-btn">', unsafe_allow_html=True)
-        if st.button("Clear conversation", use_container_width=True):
-            st.session_state.history = []
-            st.session_state.messages = []
-            st.rerun()
-        st.markdown('</div>', unsafe_allow_html=True)
+  </div>
+  {pill}
+</div>
+<div class="page-body">
+""", unsafe_allow_html=True)
 
 
-# ── Stats row ──────────────────────────────────────────────────────────────
+# ── Data loaders ───────────────────────────────────────────────────────────
+def parse_md_table(raw):
+    if not raw or "|" not in raw: return []
+    rows = [r for r in raw.split("\n") if r.startswith("|") and "---" not in r]
+    if len(rows) < 2: return []
+    headers = [h.strip() for h in rows[0].split("|")[1:-1]]
+    result  = []
+    for row in rows[1:]:
+        vals = [v.strip() for v in row.split("|")[1:-1]]
+        if len(vals) == len(headers):
+            result.append(dict(zip(headers, vals)))
+    return result
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_stats():
     try:
         from bigquery_tools import run_sql
         return run_sql("""
-            SELECT
-              COUNT(*) as total,
-              ROUND(AVG(k.open_rate_percent), 1) as avg_open,
-              ROUND(AVG(k.ctr_percent), 2) as avg_ctr,
+            SELECT COUNT(*) as total,
+              ROUND(AVG(k.open_rate_percent),1) as avg_open,
+              ROUND(AVG(k.ctr_percent),2) as avg_ctr,
               COUNT(DISTINCT e.hook_type) as hook_types
             FROM `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase` k
             LEFT JOIN `x-fabric-494718-d1.datasetmailchimp.EmailEnrichment` e
-              USING (campaign_id)
+              ON k.campaign_id = e.campaign_id
         """, max_rows=1)
-    except Exception:
-        return None
+    except: return None
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_hook_data():
+    try:
+        from bigquery_tools import run_sql
+        return run_sql("""
+            SELECT e.hook_type,
+              COUNT(*) as campaigns,
+              ROUND(AVG(k.open_rate_percent),1) as avg_open,
+              ROUND(AVG(k.ctr_percent),2) as avg_ctr
+            FROM `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase` k
+            JOIN `x-fabric-494718-d1.datasetmailchimp.EmailEnrichment` e
+              ON k.campaign_id = e.campaign_id
+            WHERE e.hook_type IS NOT NULL AND e.hook_type != ''
+            GROUP BY e.hook_type ORDER BY avg_open DESC
+        """, max_rows=20)
+    except: return None
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_tone_data():
+    try:
+        from bigquery_tools import run_sql
+        return run_sql("""
+            SELECT e.tone, COUNT(*) as campaigns,
+              ROUND(AVG(k.open_rate_percent),1) as avg_open
+            FROM `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase` k
+            JOIN `x-fabric-494718-d1.datasetmailchimp.EmailEnrichment` e
+              ON k.campaign_id = e.campaign_id
+            WHERE e.tone IS NOT NULL AND e.tone != ''
+            GROUP BY e.tone ORDER BY campaigns DESC
+        """, max_rows=10)
+    except: return None
+
+
+# ── KPIs ───────────────────────────────────────────────────────────────────
+stat_vals = ["—","—","—","—"]
 if not missing:
-    stat_vals = ["—", "—", "—", "—"]
-    stats_raw = load_stats()
-    if stats_raw and "|" in stats_raw:
-        rows = [r for r in stats_raw.split("\n") if r.startswith("|") and "---" not in r]
-        if len(rows) >= 2:
-            vals = [v.strip() for v in rows[1].split("|")[1:-1]]
-            if len(vals) == 4:
-                stat_vals = vals
+    parsed = parse_md_table(load_stats())
+    if parsed:
+        stat_vals = list(parsed[0].values())
 
-    labels   = ["Campaigns", "Avg Open Rate", "Avg CTR", "Hook Types"]
-    suffixes = ["", "%", "%", ""]
-
-    cards_html = '<div class="metric-row">'
-    for val, label, suffix in zip(stat_vals, labels, suffixes):
-        cards_html += f"""
-        <div class="metric-card">
-            <div class="metric-val">{val}{suffix}</div>
-            <div class="metric-lbl">{label}</div>
-        </div>"""
-    cards_html += '</div>'
-    st.markdown(cards_html, unsafe_allow_html=True)
-
-
-# ── Suggestions (empty state) ──────────────────────────────────────────────
-SUGGESTIONS = [
-    "Top 10 campaigns by open rate",
-    "Compare hook types — which works best?",
-    "Urgency emails with open rate > 30%",
-    "Subject line patterns for high CTR",
-    "Lithuanian campaigns with curiosity hooks",
-    "Highest unsubscribe rate campaigns",
-    "Best performing discount campaigns",
-    "Campaigns by language breakdown",
+KPI = [
+    ("Campaigns",    "",  "All time",          "d-neu"),
+    ("Avg Open Rate","%", "vs industry 21%",   "d-up"),
+    ("Avg CTR",      "%", "vs industry 2.6%",  "d-up"),
+    ("Hook Types",   "",  "GPT classified",     "d-neu"),
 ]
-
-if not st.session_state.messages:
-    st.markdown('<div class="section-label">Suggested questions</div>', unsafe_allow_html=True)
-
-    # 4 chips per row
-    row1 = st.columns(4)
-    row2 = st.columns(4)
-    for i, suggestion in enumerate(SUGGESTIONS):
-        col = row1[i] if i < 4 else row2[i - 4]
-        with col:
-            if st.button(suggestion, key=f"sug_{i}"):
-                st.session_state.pending_question = suggestion
-                st.rerun()
-
-    st.markdown("<div style='height:32px'></div>", unsafe_allow_html=True)
+cards_html = "".join(
+    f'<div class="kpi-card"><div class="kpi-val">{stat_vals[i]}{s}</div>'
+    f'<div class="kpi-lbl">{l}</div>'
+    f'<div class="kpi-delta {cls}">{hint}</div></div>'
+    for i,(l,s,hint,cls) in enumerate(KPI)
+)
+st.markdown(f'<div class="kpi-grid">{cards_html}</div>', unsafe_allow_html=True)
 
 
-# ── Chat history ───────────────────────────────────────────────────────────
-for msg in st.session_state.messages:
-    role = msg["role"]
-    content = msg["content"]
-    if role == "user":
-        st.markdown(f'<div class="user-msg">{content}</div>', unsafe_allow_html=True)
-    else:
-        # Detect tool usage hints in content and show badges
-        badges = ""
-        if any(kw in content.lower() for kw in ["open rate", "ctr", "campaigns", "avg", "%", "hook"]):
-            badges += '<span class="tool-badge badge-sql">⬡ SQL</span>'
-        if any(kw in content.lower() for kw in ["similar", "semantic", "found", "score", "preview"]):
-            badges += '<span class="tool-badge badge-rag">◈ RAG</span>'
+# ── Charts ─────────────────────────────────────────────────────────────────
+if not missing:
+    try:
+        import plotly.graph_objects as go
 
-        with st.chat_message("assistant", avatar="✉"):
-            if badges:
-                st.markdown(badges, unsafe_allow_html=True)
+        hook_data = parse_md_table(load_hook_data())
+        tone_data = parse_md_table(load_tone_data())
+
+        c1, c2 = st.columns([3, 2], gap="medium")
+
+        with c1:
+            st.markdown('<div class="chart-card"><div class="sec-hd"><span class="sec-title">Open Rate by Hook Type</span><span class="sec-sub">avg %</span></div>', unsafe_allow_html=True)
+            if hook_data:
+                hooks  = [d["hook_type"].title() for d in hook_data]
+                opens  = [float(d["avg_open"]) for d in hook_data]
+                counts = [int(d["campaigns"]) for d in hook_data]
+                colors = ["#4f46e5" if o == max(opens) else "#c7d2fe" for o in opens]
+                fig = go.Figure(go.Bar(
+                    x=opens, y=hooks, orientation="h",
+                    marker_color=colors,
+                    text=[f"{o}%" for o in opens], textposition="outside",
+                    customdata=counts,
+                    hovertemplate="<b>%{y}</b><br>Open rate: %{x}%<br>Campaigns: %{customdata}<extra></extra>",
+                ))
+                fig.update_layout(
+                    height=260, margin=dict(l=0,r=40,t=4,b=0),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family="DM Sans",size=12,color="#78716c"),
+                    xaxis=dict(showgrid=True, gridcolor="#f0ece4", zeroline=False,
+                               ticksuffix="%", range=[0, max(opens)*1.25]),
+                    yaxis=dict(showgrid=False), showlegend=False,
+                )
+                st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+            else:
+                st.caption("Enrichment in progress…")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        with c2:
+            st.markdown('<div class="chart-card"><div class="sec-hd"><span class="sec-title">Tone Distribution</span><span class="sec-sub">campaigns</span></div>', unsafe_allow_html=True)
+            if tone_data:
+                tones  = [d["tone"].title() for d in tone_data]
+                counts = [int(d["campaigns"]) for d in tone_data]
+                PALETTE = ["#4f46e5","#818cf8","#c7d2fe","#e0e7ff","#6366f1","#a5b4fc","#3730a3","#312e81"]
+                fig2 = go.Figure(go.Pie(
+                    labels=tones, values=counts, hole=0.55,
+                    marker_colors=PALETTE[:len(tones)],
+                    textinfo="percent", textfont_size=11,
+                    hovertemplate="<b>%{label}</b><br>%{value} campaigns<br>%{percent}<extra></extra>",
+                ))
+                fig2.update_layout(
+                    height=260, margin=dict(l=0,r=0,t=4,b=0),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    font=dict(family="DM Sans",size=12,color="#78716c"),
+                    legend=dict(orientation="v",x=1.0,y=0.5,font=dict(size=11),bgcolor="rgba(0,0,0,0)"),
+                )
+                st.plotly_chart(fig2, use_container_width=True, config={"displayModeBar": False})
+            else:
+                st.caption("Enrichment in progress…")
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    except ImportError:
+        st.info("Install plotly: `pip install plotly`")
+
+
+# ── Divider ────────────────────────────────────────────────────────────────
+st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+
+
+# ── Chat + Controls ────────────────────────────────────────────────────────
+chat_col, ctrl_col = st.columns([5, 1], gap="medium")
+
+with ctrl_col:
+    model = st.selectbox("Model", ["gpt-4o-mini","gpt-4o"], index=0, label_visibility="collapsed")
+    os.environ["AGENT_MODEL"] = model
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="btn-flat">', unsafe_allow_html=True)
+    if st.button("🗑 Clear", use_container_width=True):
+        st.session_state.history  = []
+        st.session_state.messages = []
+        st.session_state.last_df  = None
+        st.rerun()
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if st.session_state.last_df is not None:
+        df = st.session_state.last_df
+        st.download_button("⬇ CSV", df.to_csv(index=False).encode(),
+            file_name="export.csv", mime="text/csv", use_container_width=True)
+        try:
+            import openpyxl
+            buf = io.BytesIO()
+            df.to_excel(buf, index=False, engine="openpyxl")
+            st.download_button("⬇ Excel", buf.getvalue(),
+                file_name="export.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True)
+        except ImportError:
+            pass
+
+    st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
+    st.markdown('<div style="font-size:11px;font-weight:600;color:#a8a29e;text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px;">Filters</div>', unsafe_allow_html=True)
+    fh = st.selectbox("Hook", ["Any","curiosity","urgency","social-proof","fear-of-missing-out","story","discount","question"], index=0)
+    ft = st.selectbox("Tone", ["Any","casual","formal","playful","urgent","inspirational","informational"], index=0)
+    fl = st.selectbox("Lang", ["Any","en","lt","ru","es","pl"], index=0)
+    mo = st.slider("Min open %", 0, 100, 0)
+    st.session_state.sidebar_filters = {k:v for k,v in {
+        "hook_type": None if fh=="Any" else fh,
+        "tone":      None if ft=="Any" else ft,
+        "language":  None if fl=="Any" else fl,
+        "min_open_rate": mo if mo>0 else None,
+    }.items() if v is not None}
+
+
+with chat_col:
+    st.markdown('<div class="sec-hd"><span class="sec-title">AI Assistant</span><span class="sec-sub">Ask anything about your campaigns</span></div>', unsafe_allow_html=True)
+
+    SUGGESTIONS = [
+        "Top 10 campaigns by open rate",
+        "Which hook type works best?",
+        "Urgency emails open rate > 30%",
+        "CTR by tone comparison",
+        "Campaigns by language",
+        "Best discount campaigns",
+    ]
+    if not st.session_state.messages:
+        cols = st.columns(3)
+        for i, s in enumerate(SUGGESTIONS):
+            with cols[i % 3]:
+                if st.button(s, key=f"s{i}"):
+                    st.session_state.pending_question = s
+                    st.rerun()
+        st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
+    for msg in st.session_state.messages:
+        if msg["role"] == "user":
+            st.markdown(f'<div class="msg-user">{msg["content"]}</div>', unsafe_allow_html=True)
+        else:
+            content = msg["content"]
+            badges = ""
+            if any(k in content.lower() for k in ["open rate","%","avg","count","campaigns","ctr"]):
+                badges += '<span class="badge b-sql">⬡ SQL</span>'
+            if any(k in content.lower() for k in ["similar","score:","preview:"]):
+                badges += '<span class="badge b-rag">◈ RAG</span>'
+            if badges: st.markdown(badges, unsafe_allow_html=True)
+            st.markdown('<div class="msg-bot">', unsafe_allow_html=True)
             st.markdown(content)
+            st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
 
-    st.markdown("<div style='height:4px'></div>", unsafe_allow_html=True)
 
+# ── Agent ──────────────────────────────────────────────────────────────────
+def extract_df(reply):
+    try:
+        import pandas as pd
+        rows = parse_md_table(reply)
+        if rows: return pd.DataFrame(rows)
+    except: pass
+    return None
 
-# ── Agent runner ───────────────────────────────────────────────────────────
-def run_question(question: str):
-    st.markdown(f'<div class="user-msg">{question}</div>', unsafe_allow_html=True)
-    st.session_state.messages.append({"role": "user", "content": question})
+def run_question(question):
+    with chat_col:
+        st.markdown(f'<div class="msg-user">{question}</div>', unsafe_allow_html=True)
+    st.session_state.messages.append({"role":"user","content":question})
 
-    with st.chat_message("assistant", avatar="✉"):
-        thinking = st.empty()
-        thinking.markdown("""
-        <div class="thinking">
-            <div class="dot"></div><div class="dot"></div><div class="dot"></div>
-            <span>Thinking…</span>
-        </div>
-        """, unsafe_allow_html=True)
-
+    with chat_col:
+        ph = st.empty()
+        ph.markdown('<div class="thinking"><div class="dot"></div><div class="dot"></div><div class="dot"></div><span>Analysing…</span></div>', unsafe_allow_html=True)
         try:
             from agent import run_agent
             filters = st.session_state.get("sidebar_filters", {})
-            augmented = question
+            aug = question
             if filters:
-                filter_str = ", ".join(f"{k}={v}" for k, v in filters.items())
-                augmented = f"{question}\n[Active filters: {filter_str}]"
+                aug = f"{question}\n[Filters: {', '.join(f'{k}={v}' for k,v in filters.items())}]"
+            reply, hist = run_agent(aug, st.session_state.history)
+            st.session_state.history = hist
+            ph.empty()
 
-            reply, updated_history = run_agent(augmented, st.session_state.history)
-            st.session_state.history = updated_history
+            df = extract_df(reply)
+            if df is not None: st.session_state.last_df = df
 
-            thinking.empty()
-
-            # Tool badges
             badges = ""
-            if any(kw in reply.lower() for kw in ["open rate", "ctr", "%", "avg", "hook_type", "campaigns"]):
-                badges += '<span class="tool-badge badge-sql">⬡ SQL</span>'
-            if any(kw in reply.lower() for kw in ["similar", "semantic", "score:", "preview:"]):
-                badges += '<span class="tool-badge badge-rag">◈ RAG</span>'
-            if badges:
-                st.markdown(badges, unsafe_allow_html=True)
-
+            if any(k in reply.lower() for k in ["open rate","%","avg","count","ctr"]):
+                badges += '<span class="badge b-sql">⬡ SQL</span>'
+            if any(k in reply.lower() for k in ["similar","score:","preview:"]):
+                badges += '<span class="badge b-rag">◈ RAG</span>'
+            if badges: st.markdown(badges, unsafe_allow_html=True)
+            st.markdown('<div class="msg-bot">', unsafe_allow_html=True)
             st.markdown(reply)
-            st.session_state.messages.append({"role": "assistant", "content": reply})
-
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.session_state.messages.append({"role":"assistant","content":reply})
         except Exception as e:
-            thinking.empty()
+            ph.empty()
             err = f"**Error:** {e}"
-            st.markdown(err)
-            st.session_state.messages.append({"role": "assistant", "content": err})
+            st.markdown(f'<div class="msg-bot">{err}</div>', unsafe_allow_html=True)
+            st.session_state.messages.append({"role":"assistant","content":err})
 
-
-# ── Pending question from chip ─────────────────────────────────────────────
 if "pending_question" in st.session_state:
-    question = st.session_state.pop("pending_question")
-    run_question(question)
+    q = st.session_state.pop("pending_question")
+    run_question(q)
     st.rerun()
 
-
-# ── Chat input ─────────────────────────────────────────────────────────────
 if prompt := st.chat_input("Ask about your campaigns…"):
     run_question(prompt)
+
+st.markdown('</div>', unsafe_allow_html=True)
