@@ -157,6 +157,8 @@ def get_stats():
 
 # ---------------------------------------------------------------------------
 # /sync-status — last sync metadata (cached 60 s)
+# FIX: EmailKnowledgeBase has no `synced_at` column — use MAX(send_date)
+#      as a proxy for last sync timestamp.
 # ---------------------------------------------------------------------------
 _sync_cache: dict = {}
 _sync_ts: float = 0.0
@@ -176,19 +178,26 @@ def get_sync_status():
         result = run_sql(
             """
             SELECT
-              FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', MAX(synced_at))
-                AS last_sync_at,
-              FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ',
-                TIMESTAMP_ADD(MAX(synced_at), INTERVAL 24 HOUR))
-                AS next_sync_at,
-              COUNTIF(synced_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR))
+              -- Use MAX(send_date) as a proxy since there is no synced_at column
+              FORMAT_TIMESTAMP(
+                '%Y-%m-%dT%H:%M:%SZ',
+                MAX(TIMESTAMP(send_date))
+              ) AS last_sync_at,
+
+              FORMAT_TIMESTAMP(
+                '%Y-%m-%dT%H:%M:%SZ',
+                TIMESTAMP_ADD(MAX(TIMESTAMP(send_date)), INTERVAL 24 HOUR)
+              ) AS next_sync_at,
+
+              -- Campaigns whose send_date is within the last 24 hours
+              COUNTIF(send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY))
                 AS added_24h,
-              COUNT(*)
-                AS total,
-              FORMAT_DATE('%Y-%m-%d', MIN(send_date))
-                AS data_from,
-              FORMAT_DATE('%Y-%m-%d', MAX(send_date))
-                AS data_to
+
+              COUNT(*) AS total,
+
+              FORMAT_DATE('%Y-%m-%d', MIN(send_date)) AS data_from,
+              FORMAT_DATE('%Y-%m-%d', MAX(send_date)) AS data_to
+
             FROM `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase`
             """,
             max_rows=1,
@@ -196,18 +205,25 @@ def get_sync_status():
 
         vals = _parse_bq_row(result)
 
-        last_sync_at = _safe(vals, 0)
-        next_sync_at = _safe(vals, 1)
+        last_sync_at        = _safe(vals, 0)
+        next_sync_at        = _safe(vals, 1)
         campaigns_added_24h = _safe(vals, 2, lambda v: int(float(v)), 0)
-        campaigns_total = _safe(vals, 3, lambda v: int(float(v)), 0)
-        data_from = _safe(vals, 4)
-        data_to = _safe(vals, 5)
+        campaigns_total     = _safe(vals, 3, lambda v: int(float(v)), 0)
+        data_from           = _safe(vals, 4)
+        data_to             = _safe(vals, 5)
 
-        # Derive sync_status from how stale the last sync is
-        sync_status = "ok"
+        # ---------------------------------------------------------------
+        # Derive sync_status
+        #   "ok"    — data exists and MAX(send_date) is reasonably recent
+        #   "error" — no rows at all, or real exception (caught below)
+        # ---------------------------------------------------------------
+        sync_status: str = "ok"
         last_error: str | None = None
 
-        if last_sync_at:
+        if campaigns_total == 0:
+            sync_status = "error"
+            last_error  = "No campaigns found in EmailKnowledgeBase"
+        elif last_sync_at:
             try:
                 last_dt = datetime.strptime(last_sync_at, "%Y-%m-%dT%H:%M:%SZ").replace(
                     tzinfo=timezone.utc
@@ -215,23 +231,26 @@ def get_sync_status():
                 age = datetime.now(timezone.utc) - last_dt
                 if age > timedelta(hours=26):
                     sync_status = "error"
-                    last_error = f"No sync in the last {int(age.total_seconds() // 3600)} hours"
+                    last_error  = (
+                        f"Latest send_date is {int(age.total_seconds() // 3600)} hours ago"
+                    )
             except ValueError as exc:
                 log.warning("Could not parse last_sync_at '%s': %s", last_sync_at, exc)
+        # If last_sync_at is None but campaigns_total > 0 something is odd
+        # but we still have data, so keep status "ok" and log a warning.
         else:
-            sync_status = "error"
-            last_error = "No sync timestamp found in BigQuery"
+            log.warning("campaigns_total=%d but last_sync_at is None", campaigns_total)
 
         _sync_cache = {
-            "last_sync_at":       last_sync_at,
-            "next_sync_at":       next_sync_at,
-            "sync_status":        sync_status,
-            "campaigns_total":    campaigns_total,
+            "last_sync_at":        last_sync_at,
+            "next_sync_at":        next_sync_at,
+            "sync_status":         sync_status,
+            "campaigns_total":     campaigns_total,
             "campaigns_added_24h": campaigns_added_24h,
-            "data_from":          data_from,
-            "data_to":            data_to,
-            "source":             "mailchimp",
-            "last_error":         last_error,
+            "data_from":           data_from,
+            "data_to":             data_to,
+            "source":              "mailchimp",
+            "last_error":          last_error,
         }
         _sync_ts = time.time()
         return _sync_cache
