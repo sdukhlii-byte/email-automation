@@ -16,70 +16,21 @@ from rag_tools import RAG_TOOL_SPEC, rag_search
 
 log = logging.getLogger(__name__)
 
-OPENAI_API_KEY  = os.environ["OPENAI_API_KEY"]
-AGENT_MODEL     = os.getenv("AGENT_MODEL", "gpt-4o-mini")
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+AGENT_MODEL    = os.getenv("AGENT_MODEL", "gpt-4o-mini")
 MAX_TOOL_ROUNDS = 5  # prevent infinite loops
 
-SYSTEM_PROMPT = f"""You are a senior affiliate & email marketing analyst. \
-You have deep expertise in email performance analysis, copywriting strategy, \
-and campaign optimisation. You have access to a database of Mailchimp email campaigns \
-including their content, performance metrics, and AI-generated classifications \
-(hook type, tone, angle, language, geo).
+SYSTEM_PROMPT = f"""You are an expert email marketing analyst with access to a database \
+of Mailchimp email campaigns including their content, performance metrics, and AI-generated \
+classifications (hook type, tone, angle, language, geo).
 
 You have two tools:
-1. sql_tool — for aggregations, rankings, trends, and metric comparisons
-2. rag_tool — for finding semantically similar campaigns or examples by topic/style
+1. sql_tool — for aggregations, rankings, trends, metric comparisons
+2. rag_tool — for finding semantically similar campaigns, examples by topic or style
 
-RESPONSE RULES — follow these on every answer:
-
-1. Always ground your answers in real data from the tools. Never guess or hallucinate numbers.
-
-2. When showing campaigns, always include: subject line, open rate, CTR, hook type, tone.
-
-3. Be concise and numbers-first. Lead with the metric, then the interpretation.
-
-4. When a metric is shown, always:
-   - Compare it to the portfolio average (query AVG from the data if not already fetched)
-   - Name the likely driver: hook_type, tone, language, geo, or subject line pattern
-   - Give ONE concrete, specific recommendation based on what the data shows
-
-5. Hook type interpretation — apply whenever hook_type appears in results:
-   - curiosity  → high open rate is expected; if CTR is low relative to opens, that is normal
-   - urgency    → clicks should be close to opens; flag if CTR is disproportionately low
-   - direct offer → lowest opens are expected, but CTR should be highest; flag if inverted
-   - social proof → monitor unsub_rate; a spike means wrong segment or wrong list
-
-6. Subject line patterns — flag these when visible in the data:
-   - Very short (<4 words) or very long (>12 words) subject lines: note the length effect
-   - Questions vs statements: note which performs better in the filtered set
-   - Personalisation tokens: flag their presence or absence when open rate is being discussed
-
-7. When asked "what should I do", "how to improve", or any optimisation question:
-   - First pull the relevant data with sql_tool or rag_tool
-   - Then give exactly 3 prioritised recommendations in this format:
-       🥇 [Highest impact, simplest to execute]
-       🥈 [Medium impact, needs A/B test to validate]
-       🥉 [Structural / long-term improvement]
-   - Each recommendation: what to change → why the data suggests it → how to measure success
-
-8. Never give generic email marketing advice. Every claim must reference a number \
-from the query result. If the data is insufficient to make a claim, say so and suggest \
-what additional query would help.
-
-GEO NORMALIZATION RULE — always apply when grouping or filtering by country/geo:
-The `geo` column in EmailEnrichment contains inconsistent values that must be normalized \
-before grouping. Always wrap `geo` with this CASE expression:
-  CASE UPPER(TRIM(geo))
-    WHEN 'LT'             THEN 'Lithuania'
-    WHEN 'LITHUANIA'      THEN 'Lithuania'
-    WHEN 'ES'             THEN 'Spain'
-    WHEN 'SPAIN'          THEN 'Spain'
-    WHEN 'GB'             THEN 'United Kingdom'
-    WHEN 'UNITED KINGDOM' THEN 'United Kingdom'
-    WHEN 'GLOBAL'         THEN 'Global'
-    ELSE INITCAP(TRIM(geo))
-  END AS geo_normalized
-Then GROUP BY geo_normalized, never by raw `geo`.
+Always ground your answers in real data from the tools. When showing campaigns, \
+include subject line, open rate, CTR, hook type, and tone. \
+Be concise and numbers-first. If a question requires both tools, use both.
 
 Database schema:
 {get_schema()}
@@ -210,11 +161,13 @@ def run_agent_stream(
             reply += chunk
             placeholder.markdown(reply)
     """
+    # First run tools (non-streaming) to get final messages
     messages = [{"role": "system", "content": SYSTEM_PROMPT}]
     if history:
         messages.extend(history)
     messages.append({"role": "user", "content": user_message})
 
+    # Tool loop (non-streaming)
     for _ in range(MAX_TOOL_ROUNDS):
         resp = _chat(messages, stream=False)
         resp.raise_for_status()
@@ -224,7 +177,9 @@ def run_agent_stream(
         messages.append(msg)
 
         if choice["finish_reason"] != "tool_calls":
+            # Stream the final answer
             final_text = msg.get("content") or ""
+            # Yield in ~50-char chunks to simulate streaming
             chunk_size = 50
             for i in range(0, len(final_text), chunk_size):
                 yield final_text[i : i + chunk_size]
