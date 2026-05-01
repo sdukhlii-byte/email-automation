@@ -12,4 +12,4 @@ openpyxl
 dateparser
 fastapi>=0.111.0
 uvicorn>=0.29.0
-redis
+redis>=5.0.0
