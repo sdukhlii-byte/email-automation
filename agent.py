@@ -113,6 +113,8 @@ class _ResponseCache:
                 self._r.delete(self._key(normalised))
             except Exception as e:
                 log.warning("Cache INVALIDATE error: %s", e)
+                        # Singleton instance used by run_agent / run_agent_stream
+_cache = _ResponseCache()
 # ===========================================================================
 # CHANGE 2 — Question normalisation
 # ===========================================================================
