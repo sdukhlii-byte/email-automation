@@ -1,28 +1,35 @@
 """
 FastAPI backend — Email Marketing Intelligence
 Endpoints:
-  GET  /stats       — dashboard metrics from BigQuery
-  POST /chat        — agent chat with tool calls
-  GET  /health      — health check
+  GET  /health       — health check
+  GET  /stats        — dashboard metrics from BigQuery
+  GET  /sync-status  — last sync metadata from BigQuery
+  POST /chat         — agent chat with tool calls
 """
 
 import json
 import logging
 import os
+import re
+import time
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
 app = FastAPI(title="Email Intelligence API", version="1.0.0")
 
-# ---------------------------------------------------------------------------
-# CORS — allow Lovable frontend
-# ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # tighten to your Lovable domain in production
@@ -32,7 +39,7 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Request / Response models
+# Pydantic models
 # ---------------------------------------------------------------------------
 class ChatRequest(BaseModel):
     message: str
@@ -41,7 +48,7 @@ class ChatRequest(BaseModel):
 
 
 class ChartData(BaseModel):
-    type: str           # "bar" | "line" | "pie"
+    type: str        # "bar" | "line" | "pie"
     title: str
     data: list[dict]
     x_key: str = ""
@@ -61,6 +68,38 @@ class StatsResponse(BaseModel):
     hook_types: int
 
 
+class SyncStatusResponse(BaseModel):
+    last_sync_at: str | None
+    next_sync_at: str | None
+    sync_status: str          # "ok" | "running" | "error"
+    campaigns_total: int
+    campaigns_added_24h: int
+    data_from: str | None
+    data_to: str | None
+    source: str
+    last_error: str | None
+
+
+# ---------------------------------------------------------------------------
+# Shared BigQuery helper — parses the markdown table returned by run_sql
+# ---------------------------------------------------------------------------
+def _parse_bq_row(result: str) -> list[str]:
+    """Return a list of cell values from the first data row of a run_sql result."""
+    lines = [r for r in result.split("\n") if r.startswith("|") and "---" not in r]
+    if len(lines) < 2:
+        return []
+    return [v.strip() for v in lines[1].split("|")[1:-1]]
+
+
+def _safe(vals: list[str], index: int, cast=str, default=None):
+    """Safely cast a cell value; return default on missing / null-like values."""
+    try:
+        v = vals[index]
+        return default if v in ("", "None", "NULL", "null") else cast(v)
+    except Exception:
+        return default
+
+
 # ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
@@ -70,11 +109,10 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Stats endpoint — cached in memory for 5 min
+# /stats — dashboard metrics (cached 5 min)
 # ---------------------------------------------------------------------------
-import time
 _stats_cache: dict = {}
-_stats_ts: float = 0
+_stats_ts: float = 0.0
 STATS_TTL = 300  # seconds
 
 
@@ -87,26 +125,27 @@ def get_stats():
 
     try:
         from bigquery_tools import run_sql
-        result = run_sql("""
+
+        result = run_sql(
+            """
             SELECT
-              COUNT(*) as total,
-              ROUND(AVG(k.open_rate_percent), 1) as avg_open,
-              ROUND(AVG(k.ctr_percent), 2) as avg_ctr,
-              COUNT(DISTINCT e.hook_type) as hook_types
+              COUNT(*)                               AS total,
+              ROUND(AVG(k.open_rate_percent), 1)     AS avg_open,
+              ROUND(AVG(k.ctr_percent), 2)           AS avg_ctr,
+              COUNT(DISTINCT e.hook_type)            AS hook_types
             FROM `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase` k
             LEFT JOIN `x-fabric-494718-d1.datasetmailchimp.EmailEnrichment` e
               USING (campaign_id)
-        """, max_rows=1)
+            """,
+            max_rows=1,
+        )
 
-        # Parse markdown table from run_sql output
-        lines = [r for r in result.split("\n") if r.startswith("|") and "---" not in r]
-        vals = [v.strip() for v in lines[1].split("|")[1:-1]] if len(lines) >= 2 else []
-
+        vals = _parse_bq_row(result)
         _stats_cache = {
-            "total_campaigns": int(float(vals[0])) if vals else 0,
-            "avg_open_rate":   float(vals[1]) if len(vals) > 1 else 0.0,
-            "avg_ctr":         float(vals[2]) if len(vals) > 2 else 0.0,
-            "hook_types":      int(float(vals[3])) if len(vals) > 3 else 0,
+            "total_campaigns": _safe(vals, 0, lambda v: int(float(v)), 0),
+            "avg_open_rate":   _safe(vals, 1, float, 0.0),
+            "avg_ctr":         _safe(vals, 2, float, 0.0),
+            "hook_types":      _safe(vals, 3, lambda v: int(float(v)), 0),
         }
         _stats_ts = time.time()
         return _stats_cache
@@ -117,72 +156,147 @@ def get_stats():
 
 
 # ---------------------------------------------------------------------------
-# Chart extraction — agent can signal charts via special marker in reply
+# /sync-status — last sync metadata (cached 60 s)
 # ---------------------------------------------------------------------------
-import re
+_sync_cache: dict = {}
+_sync_ts: float = 0.0
+SYNC_TTL = 60  # seconds
+
+
+@app.get("/sync-status", response_model=SyncStatusResponse)
+def get_sync_status():
+    global _sync_cache, _sync_ts
+
+    if _sync_cache and time.time() - _sync_ts < SYNC_TTL:
+        return _sync_cache
+
+    try:
+        from bigquery_tools import run_sql
+
+        result = run_sql(
+            """
+            SELECT
+              FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', MAX(synced_at))
+                AS last_sync_at,
+              FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ',
+                TIMESTAMP_ADD(MAX(synced_at), INTERVAL 24 HOUR))
+                AS next_sync_at,
+              COUNTIF(synced_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR))
+                AS added_24h,
+              COUNT(*)
+                AS total,
+              FORMAT_DATE('%Y-%m-%d', MIN(send_date))
+                AS data_from,
+              FORMAT_DATE('%Y-%m-%d', MAX(send_date))
+                AS data_to
+            FROM `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase`
+            """,
+            max_rows=1,
+        )
+
+        vals = _parse_bq_row(result)
+
+        last_sync_at = _safe(vals, 0)
+        next_sync_at = _safe(vals, 1)
+        campaigns_added_24h = _safe(vals, 2, lambda v: int(float(v)), 0)
+        campaigns_total = _safe(vals, 3, lambda v: int(float(v)), 0)
+        data_from = _safe(vals, 4)
+        data_to = _safe(vals, 5)
+
+        # Derive sync_status from how stale the last sync is
+        sync_status = "ok"
+        last_error: str | None = None
+
+        if last_sync_at:
+            try:
+                last_dt = datetime.strptime(last_sync_at, "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=timezone.utc
+                )
+                age = datetime.now(timezone.utc) - last_dt
+                if age > timedelta(hours=26):
+                    sync_status = "error"
+                    last_error = f"No sync in the last {int(age.total_seconds() // 3600)} hours"
+            except ValueError as exc:
+                log.warning("Could not parse last_sync_at '%s': %s", last_sync_at, exc)
+        else:
+            sync_status = "error"
+            last_error = "No sync timestamp found in BigQuery"
+
+        _sync_cache = {
+            "last_sync_at":       last_sync_at,
+            "next_sync_at":       next_sync_at,
+            "sync_status":        sync_status,
+            "campaigns_total":    campaigns_total,
+            "campaigns_added_24h": campaigns_added_24h,
+            "data_from":          data_from,
+            "data_to":            data_to,
+            "source":             "mailchimp",
+            "last_error":         last_error,
+        }
+        _sync_ts = time.time()
+        return _sync_cache
+
+    except Exception as e:
+        log.error("Sync status error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Chart extraction — agent signals charts via a special marker in its reply
+# ---------------------------------------------------------------------------
+_CHART_PATTERN = re.compile(r"<<<CHART(\{.*?\})>>>", re.DOTALL)
+
 
 def extract_chart(reply: str) -> tuple[str, ChartData | None]:
     """
-    Agent can embed chart JSON in reply using marker:
-    <<<CHART{"type":"bar","title":"...","data":[...],"x_key":"...","y_key":"..."}>>>
-    This strips it from text and returns (clean_reply, ChartData|None)
+    Strip the <<<CHART{...}>>> marker from the agent reply and parse it.
+    Returns (clean_reply, ChartData | None).
     """
-    pattern = r"<<<CHART(\{.*?\})>>>"
-    match = re.search(pattern, reply, re.DOTALL)
+    match = _CHART_PATTERN.search(reply)
     if not match:
         return reply, None
 
-    clean_reply = reply[:match.start()].strip() + reply[match.end():].strip()
+    clean_reply = (reply[: match.start()] + reply[match.end() :]).strip()
     try:
-        chart_dict = json.loads(match.group(1))
-        return clean_reply, ChartData(**chart_dict)
+        return clean_reply, ChartData(**json.loads(match.group(1)))
     except Exception as e:
         log.warning("Chart parse error: %s", e)
         return clean_reply, None
 
 
 # ---------------------------------------------------------------------------
-# System prompt addon — teaches agent to emit charts
+# Chart instructions injected into every agent turn
 # ---------------------------------------------------------------------------
 CHART_INSTRUCTIONS = """
-When your answer involves ranking, comparison, or time-series data that would be 
-clearer as a chart, append a chart marker AFTER your text reply in this exact format:
+When your answer involves ranking, comparison, or time-series data that would be
+clearer as a chart, append ONE chart marker AFTER your text reply in this exact format:
 
 <<<CHART{"type":"bar","title":"Open Rate by Hook Type","data":[{"hook":"curiosity","value":34.2},{"hook":"urgency","value":28.1}],"x_key":"hook","y_key":"value"}>>>
 
 Chart types: "bar" for comparisons, "line" for trends, "pie" for distributions.
 Keep data arrays under 20 items. Only emit ONE chart per response.
-If no chart is needed, do not include the marker.
+If no chart is needed, omit the marker entirely.
 """
 
 
 # ---------------------------------------------------------------------------
-# Chat endpoint
+# /chat — agent endpoint
 # ---------------------------------------------------------------------------
 @app.post("/chat", response_model=ChatResponse)
 def chat(req: ChatRequest):
     try:
         from agent import run_agent
 
-        # Augment message with filters if set
         message = req.message
         if req.filters:
             filter_str = ", ".join(f"{k}={v}" for k, v in req.filters.items())
             message = f"{message}\n[Active filters: {filter_str}]"
 
-        # Inject chart instructions into first user message
         augmented = f"{message}\n\n{CHART_INSTRUCTIONS}"
-
         reply, updated_history = run_agent(augmented, req.history or None)
-
-        # Extract chart if present
         clean_reply, chart = extract_chart(reply)
 
-        return ChatResponse(
-            reply=clean_reply,
-            history=updated_history,
-            chart=chart,
-        )
+        return ChatResponse(reply=clean_reply, history=updated_history, chart=chart)
 
     except Exception as e:
         log.error("Chat error: %s", e)
@@ -194,4 +308,10 @@ def chat(req: ChatRequest):
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("api:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=True)
+
+    uvicorn.run(
+        "api:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        reload=True,
+    )
