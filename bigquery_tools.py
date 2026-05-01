@@ -233,7 +233,7 @@ def run_sql(query: str, max_rows: int = 50) -> str:
             default_dataset=f"{PROJECT}.{DATASET}",
             maximum_bytes_billed=100 * 1024 * 1024,
         )
-        rows = list(client.query(query, job_config=job_config).result())
+        rows = list(client.query(query, job_config=job_config).result(timeout=30))
 
         if not rows:
             return "Query returned 0 rows."
