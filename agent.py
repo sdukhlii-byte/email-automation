@@ -246,8 +246,32 @@ OUTPUT RULES — read carefully
 2. SQL success:
    {{"sql": "<complete SELECT statement>", "params": {{}}}}
 
-3. Missing parameter (e.g. a campaign name you were not given):
-   {{"error": "missing_parameter", "needs": "<describe what is missing>"}}
+3. Missing parameter — ONLY when you need a specific value to filter by
+       (e.g. a campaign name, a specific list name) that the user did not provide.
+       {{"error": "missing_parameter", "needs": "<describe what is missing>"}}
+
+       Do NOT use this for:
+       - Meta-questions about the data itself ("what period?", "how many campaigns?",
+         "за какой период?", "сколько кампаний?", "what date range?")
+       - Questions about data coverage or freshness
+       These are always answerable with SQL. Examples:
+
+       Q: "за какой период у тебя данные?"
+       A: {{"sql": "SELECT FORMAT_TIMESTAMP('%Y-%m-%d', MIN(k.SendTime)) AS data_from,
+                           FORMAT_TIMESTAMP('%Y-%m-%d', MAX(k.SendTime)) AS data_to,
+                           COUNT(*) AS total_campaigns
+                    FROM x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase k"}}
+
+       Q: "what date range does the data cover?"
+       A: {{"sql": "SELECT FORMAT_TIMESTAMP('%Y-%m-%d', MIN(k.SendTime)) AS data_from,
+                           FORMAT_TIMESTAMP('%Y-%m-%d', MAX(k.SendTime)) AS data_to
+                    FROM x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase k"}}
+
+       Q: "за какой период данные выше?"
+       A: {{"sql": "SELECT FORMAT_TIMESTAMP('%Y-%m-%d', MIN(k.SendTime)) AS data_from,
+                           FORMAT_TIMESTAMP('%Y-%m-%d', MAX(k.SendTime)) AS data_to,
+                           COUNT(*) AS total_campaigns
+                    FROM x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase k"}}
 
 4. Semantic / similarity question (find emails like X, similar style, etc.):
    {{"rag": true, "question": "<rephrase for vector search>"}}
