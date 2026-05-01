@@ -39,7 +39,12 @@ _HISTORY_SENTINEL = "\x00HISTORY\x00"
 # ---------------------------------------------------------------------------
 def _trim_history(history: list[dict]) -> list[dict]:
     """Keep conversation within token budget.
-    Always preserves the first message, drops oldest pairs when over limit."""
+    Always preserves the first message, drops oldest user+assistant pairs when over limit.
+
+    FIX #7: was dropping history[1:4] (3 messages) per iteration which could leave
+    orphaned tool messages without a preceding tool_call, causing OpenAI API errors.
+    Now drops history[1:3] (one user+assistant pair) per iteration.
+    """
     if not history:
         return history
     if len(history) > MAX_HISTORY_MSGS:
@@ -47,7 +52,8 @@ def _trim_history(history: list[dict]) -> list[dict]:
     while len(history) > 2:
         if sum(len(json.dumps(m)) for m in history) <= _HISTORY_CHAR_LIMIT:
             break
-        history = [history[0]] + history[3:]
+        # Drop one user+assistant pair (indices 1 and 2), keep the rest
+        history = [history[0]] + history[2:]
     return history
 
 
