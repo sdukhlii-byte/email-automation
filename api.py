@@ -223,7 +223,7 @@ def get_sync_status():
                     tzinfo=timezone.utc
                 )
                 age = datetime.now(timezone.utc) - last_dt
-                if age > timedelta(hours=26):
+                if age > timedelta(days=7):
                     sync_status = "error"
                     last_error  = (
                         f"Latest SendTime is {int(age.total_seconds() // 3600)} hours ago"
