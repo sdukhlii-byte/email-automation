@@ -32,7 +32,7 @@ app = FastAPI(title="Email Intelligence API", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten to your Lovable domain in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -55,10 +55,21 @@ class ChartData(BaseModel):
     y_key: str = ""
 
 
+class DataPeriod(BaseModel):
+    from_: str | None = None   # ISO date, inclusive
+    to:    str | None = None   # ISO date, inclusive
+    rows:  int | None = None   # rows used to compute the answer
+    label: str | None = None   # "last 7 days", "all time", etc.
+
+    class Config:
+        fields = {"from_": "from"}
+
+
 class ChatResponse(BaseModel):
     reply: str
     history: list[dict]
     chart: ChartData | None = None
+    data_period: DataPeriod | None = None
 
 
 class StatsResponse(BaseModel):
@@ -157,7 +168,7 @@ def get_stats():
 
 # ---------------------------------------------------------------------------
 # /sync-status — last sync metadata (cached 60 s)
-# Column is SendTime (TIMESTAMP) — used directly, no cast needed
+# SendTime is TIMESTAMP — used directly, no cast needed
 # ---------------------------------------------------------------------------
 _sync_cache: dict = {}
 _sync_ts: float = 0.0
@@ -206,11 +217,6 @@ def get_sync_status():
         data_from           = _safe(vals, 4)
         data_to             = _safe(vals, 5)
 
-        # ---------------------------------------------------------------
-        # Derive sync_status
-        #   "ok"    — data exists and MAX(SendTime) is reasonably recent
-        #   "error" — table empty, or real exception (caught below)
-        # ---------------------------------------------------------------
         sync_status: str = "ok"
         last_error: str | None = None
 
@@ -253,21 +259,16 @@ def get_sync_status():
 
 
 # ---------------------------------------------------------------------------
-# Chart extraction — agent signals charts via a special marker in its reply
+# Chart extraction
 # ---------------------------------------------------------------------------
 _CHART_PATTERN = re.compile(r"<<<CHART(\{.*?\})>>>", re.DOTALL)
 
 
 def extract_chart(reply: str) -> tuple[str, ChartData | None]:
-    """
-    Strip the <<<CHART{...}>>> marker from the agent reply and parse it.
-    Returns (clean_reply, ChartData | None).
-    """
     match = _CHART_PATTERN.search(reply)
     if not match:
         return reply, None
-
-    clean_reply = (reply[: match.start()] + reply[match.end() :]).strip()
+    clean_reply = (reply[: match.start()] + reply[match.end():]).strip()
     try:
         return clean_reply, ChartData(**json.loads(match.group(1)))
     except Exception as e:
@@ -276,18 +277,68 @@ def extract_chart(reply: str) -> tuple[str, ChartData | None]:
 
 
 # ---------------------------------------------------------------------------
-# Chart instructions injected into every agent turn
+# Period extraction
 # ---------------------------------------------------------------------------
-CHART_INSTRUCTIONS = """
-When your answer involves ranking, comparison, or time-series data that would be
-clearer as a chart, append ONE chart marker AFTER your text reply in this exact format:
+_PERIOD_PATTERN = re.compile(r"<<<PERIOD(\{.*?\})>>>", re.DOTALL)
 
-<<<CHART{"type":"bar","title":"Open Rate by Hook Type","data":[{"hook":"curiosity","value":34.2},{"hook":"urgency","value":28.1}],"x_key":"hook","y_key":"value"}>>>
 
-Chart types: "bar" for comparisons, "line" for trends, "pie" for distributions.
-Keep data arrays under 20 items. Only emit ONE chart per response.
-If no chart is needed, omit the marker entirely.
+def extract_period(reply: str) -> tuple[str, DataPeriod | None]:
+    m = _PERIOD_PATTERN.search(reply)
+    if not m:
+        return reply, None
+    clean = (reply[: m.start()] + reply[m.end():]).strip()
+    try:
+        raw = json.loads(m.group(1))
+        if "from" in raw:
+            raw["from_"] = raw.pop("from")
+        return clean, DataPeriod(**raw)
+    except Exception as e:
+        log.warning("Period parse error: %s", e)
+        return clean, None
+
+
+# ---------------------------------------------------------------------------
+# Response style — injected into every /chat call instead of CHART_INSTRUCTIONS
+# ---------------------------------------------------------------------------
+RESPONSE_STYLE = """
+You are a senior email-marketing analyst. Reply in the user's language.
+
+RESPONSE FORMAT — choose ONE based on the question:
+
+1. CONVERSATIONAL (greetings, clarifications, single-fact lookups, opinions,
+   follow-ups, "what do you think", "explain", "почему", "как"):
+   - Plain prose, max 3 short sentences.
+   - NO tables, NO bullet lists, NO chart marker.
+
+2. ANALYTICAL (ranking, comparison, distribution, trend, top-N, breakdowns
+   with 3+ rows of real data):
+   - One concise paragraph (1-2 sentences) with the headline insight.
+   - Then ONE artifact: either a markdown table OR a chart marker — never both
+     unless the user explicitly asked for both.
+   - Tables: standard GitHub markdown, ≤ 10 rows, ≤ 5 columns.
+
+PERIOD HONESTY — non-negotiable:
+- If your reply mentions any timeframe ("last week", "this month", "за неделю",
+  "за месяц", "за 30 дней", etc.) the SQL you ran MUST contain a matching
+  WHERE SendTime >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL N DAY).
+- If no such WHERE was applied, the reply must say "за всё время" / "all-time" —
+  never invent or imply a period.
+- After your answer, append on its own line:
+  <<<PERIOD{"from":"YYYY-MM-DD","to":"YYYY-MM-DD","rows":N,"label":"last 7 days"}>>>
+  Use "from":null,"to":null,"label":"all time" when no date filter was applied.
+
+CHART MARKER (optional, analytical only):
+<<<CHART{"type":"bar","title":"...","data":[...],"x_key":"...","y_key":"..."}>>>
+- type: "bar" (comparisons), "line" (trends), "pie" (distributions).
+- ≤ 20 data points, exactly ONE chart per reply, omit entirely if not needed.
 """
+
+# Map of filter range keys → number of days
+_RANGE_MAP: dict[str, int] = {
+    "7d": 7,  "last_7d": 7,  "week": 7,
+    "30d": 30, "last_30d": 30, "month": 30,
+    "90d": 90, "quarter": 90,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -298,16 +349,43 @@ def chat(req: ChatRequest):
     try:
         from agent import run_agent
 
-        message = req.message
+        # Translate filters into explicit model directives
+        directives: list[str] = []
         if req.filters:
-            filter_str = ", ".join(f"{k}={v}" for k, v in req.filters.items())
-            message = f"{message}\n[Active filters: {filter_str}]"
+            f = req.filters
+            range_val = str(f.get("range") or f.get("date_range") or "").lower()
+            if range_val in _RANGE_MAP:
+                days = _RANGE_MAP[range_val]
+                directives.append(
+                    f"Restrict every SQL query with "
+                    f"WHERE SendTime >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY). "
+                    f"Refer to this period as 'last {days} days'."
+                )
+            extras = {k: v for k, v in f.items() if k not in ("range", "date_range")}
+            if extras:
+                directives.append(
+                    "Also apply these filters as SQL WHERE clauses: "
+                    + ", ".join(f"{k}={v!r}" for k, v in extras.items())
+                )
 
-        augmented = f"{message}\n\n{CHART_INSTRUCTIONS}"
+        directive_block = ("\n".join(f"- {d}" for d in directives)) if directives else "- none"
+
+        augmented = (
+            f"{RESPONSE_STYLE}\n\n"
+            f"USER FILTER DIRECTIVES:\n{directive_block}\n\n"
+            f"USER MESSAGE:\n{req.message}"
+        )
+
         reply, updated_history = run_agent(augmented, req.history or None)
-        clean_reply, chart = extract_chart(reply)
+        reply, chart  = extract_chart(reply)
+        reply, period = extract_period(reply)
 
-        return ChatResponse(reply=clean_reply, history=updated_history, chart=chart)
+        return ChatResponse(
+            reply=reply,
+            history=updated_history,
+            chart=chart,
+            data_period=period,
+        )
 
     except Exception as e:
         log.error("Chat error: %s", e)
