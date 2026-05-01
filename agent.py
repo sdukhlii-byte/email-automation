@@ -308,6 +308,14 @@ OUTPUT RULES — read carefully
     Группируй только слоты где COUNT(*) >= 20 кампаний.
     Сортируй по AVG open_rate_percent DESC только после применения
     всех HAVING фильтров.
+14. ROW-LEVEL QUALITY FILTER — ВСЕГДА добавляй в WHERE для любого запроса
+    (топ-N, списки, best/worst, одиночные строки — везде где нет GROUP BY):
+    AND k.open_rate_percent < 60
+    AND k.ctr_percent < 50
+    AND k.SubjectLine IS NOT NULL
+    AND TRIM(k.SubjectLine) != ''
+    Это исключает seed/warmy кампании на уровне строк, до сортировки.
+    Применяй ВСЕГДА, даже если пользователь не просил фильтровать.
 Output JSON only. No preamble."""
 
 
