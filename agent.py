@@ -20,7 +20,7 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 AGENT_MODEL    = os.getenv("AGENT_MODEL", "gpt-4o-mini")
 MAX_TOOL_ROUNDS = 5  # prevent infinite loops
 
-SYSTEM_PROMPT = f"""You are an expert email marketing analyst with access to a database \
+SYSTEM_PROMPT = f"""You are an expert affiliate & email marketing analyst with access to a database \
 of Mailchimp email campaigns including their content, performance metrics, and AI-generated \
 classifications (hook type, tone, angle, language, geo).
 
