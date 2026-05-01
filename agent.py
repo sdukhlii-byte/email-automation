@@ -157,10 +157,18 @@ _FILLER = re.compile(
 
 _DATE_HINTS = re.compile(
     r"\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}-\d{2}-\d{2}|"
-    r"january|february|march|april|may|june|july|august|"
+    r"january|february|march|april|june|july|august|"
     r"september|october|november|december|"
-    r"январ|феврал|март|апрел|май|июн|июл|август|"
+    r"январ|феврал|март|апрел|июн|июл|август|"
     r"сентябр|октябр|ноябр|декабр)\b",
+    re.IGNORECASE,
+)
+
+# Relative duration phrases that must NOT be parsed as calendar dates
+_RELATIVE_DURATION = re.compile(
+    r"\blast\s+\d+\s+(day|week|month|year)s?\b"
+    r"|\bпоследн\w+\s+\d+\s+(дн|недел|месяц|год)\w*\b"
+    r"|\bза\s+последн\w+\s+\d+\s+(дн|недел|месяц|год)\w*\b",
     re.IGNORECASE,
 )
 
@@ -168,6 +176,9 @@ _DATE_HINTS = re.compile(
 def _normalise_dates(q: str) -> str:
     # Only run dateparser when the question contains an explicit date hint
     if not _DATE_HINTS.search(q):
+        return q
+    # Never mangle relative duration phrases — let the LLM handle them as SQL
+    if _RELATIVE_DURATION.search(q):
         return q
     words = q.split()
     result = []
@@ -363,7 +374,10 @@ CHART MARKER (optional):
 <<<CHART{"type":"bar","title":"...","data":[...],"x_key":"...","y_key":"..."}>>>
 - type: "bar" | "line" | "pie". Max 20 points.
 
-Reply in the user's language."""
+Reply in the user's language.
+If the user wrote in English — reply in English.
+If the user wrote in Russian — reply in Russian.
+Never switch languages."""
 
 
 # ===========================================================================
@@ -397,7 +411,10 @@ RESPONSE FORMAT — one of:
 PERIOD HONESTY: append <<<PERIOD{{"from":"...","to":"...","rows":N,"label":"..."}}>>>
 CHART MARKER:   <<<CHART{{"type":"bar","title":"...","data":[...],"x_key":"...","y_key":"..."}}>>>
 
-Reply in the user's language."""
+LANGUAGE: Always reply in the same language the user wrote in.
+If the user wrote in English — reply in English.
+If the user wrote in Russian — reply in Russian.
+Never switch languages mid-conversation."""
 
 
 TOOLS = [SQL_TOOL_SPEC, RAG_TOOL_SPEC]
