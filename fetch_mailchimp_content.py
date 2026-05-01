@@ -13,6 +13,7 @@ DATASET = "datasetmailchimp"
 
 REPORTS_TABLE = f"{PROJECT_ID}.{DATASET}.Reports"
 CONTENT_TABLE = f"{PROJECT_ID}.{DATASET}.CampaignContentsRaw"
+KNOWLEDGE_TABLE = f"{PROJECT_ID}.{DATASET}.EmailKnowledgeBase"
 
 MAILCHIMP_API_KEY = os.environ["MAILCHIMP_API_KEY"]
 SERVER_PREFIX = MAILCHIMP_API_KEY.split("-")[-1]
@@ -53,6 +54,7 @@ def get_campaign_ids():
 
 def fetch_campaign_content(campaign_id, retries=3):
     url = f"https://{SERVER_PREFIX}.api.mailchimp.com/3.0/campaigns/{campaign_id}/content"
+    meta_url = f"https://{SERVER_PREFIX}.api.mailchimp.com/3.0/campaigns/{campaign_id}"
 
     for attempt in range(retries):
         try:
@@ -74,13 +76,31 @@ def fetch_campaign_content(campaign_id, retries=3):
             data = response.json()
             html = data.get("html")
 
+            # Fetch campaign metadata (subject line, preview text)
+            subject_line = None
+            preview_text = None
+            try:
+                meta_response = requests.get(
+                    meta_url,
+                    auth=("anystring", MAILCHIMP_API_KEY),
+                    timeout=30
+                )
+                if meta_response.status_code == 200:
+                    meta = meta_response.json()
+                    subject_line = meta.get("settings", {}).get("subject_line")
+                    preview_text = meta.get("settings", {}).get("preview_text")
+            except Exception as me:
+                print(f"Meta fetch error for {campaign_id}: {me}")
+
             return {
-                "campaign_id": campaign_id,
-                "html_content": html,
+                "campaign_id":        campaign_id,
+                "html_content":       html,
                 "plain_text_content": data.get("plain_text"),
-                "clean_text": clean_html(html),
-                "archive_html": data.get("archive_html"),
-                "fetched_at": datetime.now(timezone.utc).isoformat()
+                "clean_text":         clean_html(html),
+                "archive_html":       data.get("archive_html"),
+                "subject_line":       subject_line,
+                "preview_text":       preview_text,
+                "fetched_at":         datetime.now(timezone.utc).isoformat()
             }
 
         except Exception as e:
@@ -100,6 +120,52 @@ def insert_rows(rows):
     else:
         print(f"Inserted {len(rows)} rows")
 
+def update_subject_lines(rows):
+    """
+    After inserting content rows, backfill SubjectLine and
+    PreviewText into EmailKnowledgeBase using a MERGE statement.
+    """
+    if not rows:
+        return
+
+    # Build temp values for MERGE
+    value_rows = []
+    for r in rows:
+        if r.get("subject_line"):
+            cid  = r["campaign_id"].replace("'", "")
+            subj = (r["subject_line"] or "").replace("'", "\\'")
+            prev = (r["preview_text"] or "").replace("'", "\\'")
+            value_rows.append(f"('{cid}', '{subj}', '{prev}')")
+
+    if not value_rows:
+        print("No subject lines to update")
+        return
+
+    values_sql = ",\n  ".join(value_rows)
+
+    merge_sql = f"""
+    MERGE `{KNOWLEDGE_TABLE}` AS target
+    USING (
+      SELECT campaign_id, subject_line, preview_text
+      FROM UNNEST([
+        STRUCT<campaign_id STRING,
+               subject_line STRING,
+               preview_text STRING>
+        {values_sql}
+      ])
+    ) AS source
+    ON target.campaign_id = source.campaign_id
+    WHEN MATCHED THEN UPDATE SET
+      target.SubjectLine  = source.subject_line,
+      target.PreviewText  = source.preview_text
+    """
+
+    try:
+        client.query(merge_sql).result()
+        print(f"Updated SubjectLine for {len(value_rows)} campaigns")
+    except Exception as e:
+        print(f"MERGE error: {e}")
+
 def main():
     campaign_ids = get_campaign_ids()
     print(f"Campaigns to fetch: {len(campaign_ids)}")
@@ -116,11 +182,13 @@ def main():
 
         if len(rows) >= 100:
             insert_rows(rows)
+            update_subject_lines(rows)
             rows = []
 
         print(f"{i}/{len(campaign_ids)} done")
 
     insert_rows(rows)
+    update_subject_lines(rows)
     print("Done")
 
 if __name__ == "__main__":
