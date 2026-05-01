@@ -49,6 +49,34 @@ _HISTORY_CHAR_LIMIT = int(os.getenv("HISTORY_CHAR_LIMIT", "60000"))
 # Never visible to the end user.
 _HISTORY_SENTINEL = "\x00HISTORY\x00"
 
+PROJECT_CONTEXT = """
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+KNOWN PROJECTS & GEO CONTEXT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+All projects are Lithuanian (LT) or Croatian (HR) market.
+Language of emails: Lithuanian (LT), Croatian (HR).
+
+PROJECT MAP:
+- ListName LIKE 'LazybuGuru%'   → LT | Lifestyle/productivity blog | ~223 campaigns
+- ListName LIKE 'Casinoguru%'   → LT | Casino review site | ~160 campaigns
+- ListName LIKE 'SBG%'          → LT | Sports betting | ~150 campaigns
+- ListName LIKE 'PokerioMokykla%' → LT | Poker school | ~56 campaigns
+- ListName LIKE 'Stakehunters%' → LT | Staking/poker investments | ~54 campaigns
+- ListName LIKE 'geek.hr%'      → HR | IT/tech audience Croatia | ~32 campaigns
+
+QUALITY RULES:
+- AVG open_rate > 60% = seed/warmy list — EXCLUDE from analysis
+- Minimum meaningful sample = 10 campaigns per segment
+- EmailsSent < 200 = micro-campaign, note separately
+- ListName IS NULL = untagged, exclude from performance analysis
+
+GEO FILTER PATTERNS for SQL:
+- LT market: ListName LIKE 'LazybuGuru%' OR ListName LIKE 'Casinoguru%'
+             OR ListName LIKE 'SBG%' OR ListName LIKE 'PokerioMokykla%'
+             OR ListName LIKE 'Stakehunters%'
+- HR market: ListName LIKE 'geek.hr%'
+"""
+
 
 # ===========================================================================
 # CHANGE 3 — In-memory response cache (TTL configurable, default 1 h)
@@ -241,6 +269,7 @@ def _trim_history(history: list[dict]) -> list[dict]:
 # ===========================================================================
 def _build_sql_system_prompt() -> str:
     return f"""You are a BigQuery SQL generator for an email marketing database.
+{PROJECT_CONTEXT}
 
 YOUR ONLY JOB: produce a valid BigQuery SELECT query that answers the user question.
 
@@ -284,8 +313,16 @@ OUTPUT RULES — read carefully
                            COUNT(*) AS total_campaigns
                     FROM x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase k"}}
 
-4. Semantic / similarity question (find emails like X, similar style, etc.):
-   {{"rag": true, "question": "<rephrase for vector search>"}}
+4. Semantic / similarity question — use when user asks:
+   - find emails like X / similar to X
+   - show me campaigns about [topic]
+   - what subject lines work for [topic]
+   - examples of [style/hook/tone]
+   - best performing emails about [topic]
+   Output: {{"rag": true, "question": "<rephrase as noun phrase for vector search>"}}
+   IMPORTANT: question must be a descriptive noun phrase, NOT a full sentence.
+   Good:  "bonus offer urgency subject lines"
+   Bad:   "What are the best subject lines for bonus offers?"
 
 5. NEVER guess or hallucinate table/column names. Use only the schema above.
 6. ALWAYS add LIMIT N when the user asks for top-N or a list (default LIMIT 10).
@@ -342,12 +379,21 @@ Output JSON only. No preamble."""
 # CHANGE 4 — Interpretation-only system prompt
 # ===========================================================================
 def _build_interp_system_prompt() -> str:
-    return """You are an expert email marketing analyst.
+    return f"""You are an expert email marketing analyst
+specialising in Lithuanian (LT) and Croatian (HR) email marketing.
+{PROJECT_CONTEXT}
 A SQL query has already been run. You receive the raw results.
 Your job: interpret and present them clearly.
 
 RULES:
 - Do NOT generate SQL. Do NOT show SQL. Do NOT mention SQL.
+- When interpreting RAG+SQL combined results:
+  * Lead with semantic similarity insight
+    ("campaigns about X share these patterns...")
+  * Then show performance table with metrics from SQL
+  * Highlight best performer: SubjectLine + open_rate + hook_type + tone
+  * Note pattern: what do top campaigns have in common
+  * End with one concrete recommendation
 - Be numbers-first and concise.
 - Include subject line, open rate, CTR, hook type, tone when relevant.
 
@@ -358,6 +404,12 @@ RESPONSE FORMAT — pick ONE:
 
 2. ANALYTICAL (rankings, trends, top-N):
    - One headline insight sentence.
+   - DEPTH RULES — include ALL when data allows:
+     * Best performer: SubjectLine + open_rate + hook_type + tone
+     * Worst performer: what went wrong
+     * Pattern: what top campaigns have in common
+     * Recommendation: one concrete actionable suggestion
+     * Sample warning: if n < 10 add "(low sample, interpret carefully)"
    - ONE artifact: markdown table (≤15 rows, ≤6 cols) OR chart marker (not both).
      Always show breakdown rows, not just top-level aggregates.
      When data has segments (days, hours, campaigns) — show ALL segments
@@ -520,6 +572,91 @@ def _dispatch_tool(name: str, arguments: str) -> str:
 
 
 # ===========================================================================
+# ПРАВКА 1 — Combined RAG + SQL pipeline
+# ===========================================================================
+def _run_rag_then_enrich(question: str, original_message: str) -> str | None:
+    """
+    Combined RAG + SQL pipeline:
+    Phase 1: RAG semantic search → find similar campaigns
+    Phase 2: Extract campaign_ids from RAG output
+    Phase 3: SQL → get fresh performance metrics for those campaigns
+    Phase 4: LLM interpretation of combined results
+
+    Returns interpretation string, or None on failure.
+    """
+    # Phase 1: RAG search
+    log.info("RAG+SQL pipeline start: %s", question[:80])
+    rag_result = rag_search(question, top_k=8)
+
+    if not rag_result or rag_result.startswith("ERROR"):
+        log.warning("RAG returned error: %s", (rag_result or "")[:100])
+        return None
+
+    if rag_result == "No similar campaigns found.":
+        log.info("RAG: no results for question: %s", question[:80])
+        return "No similar campaigns found for that query."
+
+    # Phase 2: Extract campaign_ids
+    # RAG format: "campaign_id: `abc123`"
+    campaign_ids = re.findall(r'campaign_id: `([^`]+)`', rag_result)
+    log.info("RAG found %d campaign_ids: %s", len(campaign_ids), campaign_ids)
+
+    sql_enrichment = ""
+    if campaign_ids:
+        # Phase 3: SQL enrichment — fresh metrics from BigQuery
+        ids_str = "', '".join(campaign_ids)
+        enrich_sql = (
+            "SELECT"
+            "  k.campaign_id,"
+            "  k.SubjectLine,"
+            "  k.ListName,"
+            "  k.EmailsSent,"
+            "  ROUND(k.open_rate_percent, 1)  AS open_rate,"
+            "  ROUND(k.ctr_percent, 1)        AS ctr,"
+            "  ROUND(k.unsub_rate_percent, 2) AS unsub_rate,"
+            "  e.hook_type,"
+            "  e.tone,"
+            "  e.offer_type,"
+            "  FORMAT_TIMESTAMP('%Y-%m-%d', k.SendTime) AS sent_date"
+            " FROM `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase` k"
+            " LEFT JOIN `x-fabric-494718-d1.datasetmailchimp.EmailEnrichment` e"
+            "  USING (campaign_id)"
+            " WHERE k.campaign_id IN ('" + ids_str + "')"
+            " ORDER BY k.open_rate_percent DESC"
+        )
+        sql_enrichment = run_sql(enrich_sql)
+        log.info("SQL enrichment result: %d chars", len(sql_enrichment))
+
+        if sql_enrichment.startswith("ERROR"):
+            log.warning("SQL enrichment failed: %s", sql_enrichment[:150])
+            sql_enrichment = "(metrics unavailable)"
+
+    # Phase 4: LLM interpretation of combined results
+    combined = (
+        "Semantic search results (by content similarity):\n" + rag_result + "\n\n"
+        "Performance metrics from database:\n"
+        + (sql_enrichment if sql_enrichment else "(no campaign_ids found in RAG output)")
+    )
+
+    interp_messages = [
+        {"role": "system", "content": _build_interp_system_prompt()},
+        {
+            "role": "user",
+            "content": (
+                f"User question: {original_message}\n\n"
+                f"RAG + SQL combined data:\n{combined}"
+            ),
+        },
+    ]
+
+    resp = _chat_interp(interp_messages, stream=False)
+    resp.raise_for_status()
+    result = resp.json()["choices"][0]["message"]["content"]
+    log.info("RAG+SQL pipeline complete: %d chars", len(result))
+    return result
+
+
+# ===========================================================================
 # CHANGE 4 — Two-phase SQL→Interpret pipeline
 # ===========================================================================
 def _run_sql_then_interpret(normalised_q: str, original_message: str) -> str | None:
@@ -557,10 +694,16 @@ def _run_sql_then_interpret(normalised_q: str, original_message: str) -> str | N
         log.info("SQL-gen error: %s", parsed)
         return f"I need more information to answer that: {parsed.get('needs', 'unknown parameter')}"
 
-    # Model signalled RAG question — let the agent loop handle it
+    # Model signalled RAG question — use combined RAG+SQL pipeline
     if parsed.get("rag"):
-        log.info("SQL-gen flagged as RAG — falling through to agent loop")
-        return None
+        rag_question = parsed.get("question", normalised_q)
+        log.info("SQL-gen flagged as RAG — trying RAG+SQL pipeline: %s",
+                 rag_question[:80])
+        try:
+            return _run_rag_then_enrich(rag_question, original_message)
+        except Exception as e:
+            log.warning("RAG+SQL pipeline failed (%s) — falling through", e)
+            return None
 
     sql = parsed.get("sql", "").strip()
     if not sql:
