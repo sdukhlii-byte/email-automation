@@ -157,8 +157,7 @@ def get_stats():
 
 # ---------------------------------------------------------------------------
 # /sync-status — last sync metadata (cached 60 s)
-# FIX: EmailKnowledgeBase has no `synced_at` column — use MAX(send_date)
-#      as a proxy for last sync timestamp.
+# Column is SendTime (TIMESTAMP) — used directly, no cast needed
 # ---------------------------------------------------------------------------
 _sync_cache: dict = {}
 _sync_ts: float = 0.0
@@ -178,25 +177,20 @@ def get_sync_status():
         result = run_sql(
             """
             SELECT
-              -- Use MAX(send_date) as a proxy since there is no synced_at column
-              FORMAT_TIMESTAMP(
-                '%Y-%m-%dT%H:%M:%SZ',
-                MAX(TIMESTAMP(send_date))
-              ) AS last_sync_at,
+              FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', MAX(SendTime))
+                AS last_sync_at,
 
-              FORMAT_TIMESTAMP(
-                '%Y-%m-%dT%H:%M:%SZ',
-                TIMESTAMP_ADD(MAX(TIMESTAMP(send_date)), INTERVAL 24 HOUR)
-              ) AS next_sync_at,
+              FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ',
+                TIMESTAMP_ADD(MAX(SendTime), INTERVAL 24 HOUR))
+                AS next_sync_at,
 
-              -- Campaigns whose send_date is within the last 24 hours
-              COUNTIF(send_date >= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY))
+              COUNTIF(SendTime >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR))
                 AS added_24h,
 
               COUNT(*) AS total,
 
-              FORMAT_DATE('%Y-%m-%d', MIN(send_date)) AS data_from,
-              FORMAT_DATE('%Y-%m-%d', MAX(send_date)) AS data_to
+              FORMAT_TIMESTAMP('%Y-%m-%d', MIN(SendTime)) AS data_from,
+              FORMAT_TIMESTAMP('%Y-%m-%d', MAX(SendTime)) AS data_to
 
             FROM `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase`
             """,
@@ -214,8 +208,8 @@ def get_sync_status():
 
         # ---------------------------------------------------------------
         # Derive sync_status
-        #   "ok"    — data exists and MAX(send_date) is reasonably recent
-        #   "error" — no rows at all, or real exception (caught below)
+        #   "ok"    — data exists and MAX(SendTime) is reasonably recent
+        #   "error" — table empty, or real exception (caught below)
         # ---------------------------------------------------------------
         sync_status: str = "ok"
         last_error: str | None = None
@@ -232,12 +226,10 @@ def get_sync_status():
                 if age > timedelta(hours=26):
                     sync_status = "error"
                     last_error  = (
-                        f"Latest send_date is {int(age.total_seconds() // 3600)} hours ago"
+                        f"Latest SendTime is {int(age.total_seconds() // 3600)} hours ago"
                     )
             except ValueError as exc:
                 log.warning("Could not parse last_sync_at '%s': %s", last_sync_at, exc)
-        # If last_sync_at is None but campaigns_total > 0 something is odd
-        # but we still have data, so keep status "ok" and log a warning.
         else:
             log.warning("campaigns_total=%d but last_sync_at is None", campaigns_total)
 
