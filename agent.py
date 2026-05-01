@@ -3,8 +3,10 @@ Email Marketing Agent
 Orchestrates sql_tool and rag_tool via OpenAI function calling.
 Stateless — caller manages conversation history.
 
-v3: Streamlit dependency removed. Only run_agent (sync) is kept.
-    run_agent_stream is now a true line-by-line SSE generator for FastAPI.
+v4:
+- System prompt now enforces explicit LIMIT in SQL and forbids filtering NULL enrichment fields
+- run_agent_stream yields history as a sentinel chunk (no second LLM call)
+- HISTORY_CHAR_LIMIT corrected to 60k chars (~15k tokens)
 """
 
 import json
@@ -23,7 +25,13 @@ OPENAI_API_KEY   = os.environ["OPENAI_API_KEY"]
 AGENT_MODEL      = os.getenv("AGENT_MODEL", "gpt-4o-mini")
 MAX_TOOL_ROUNDS  = int(os.getenv("MAX_TOOL_ROUNDS", "6"))
 MAX_HISTORY_MSGS = int(os.getenv("MAX_HISTORY_MSGS", "20"))
-_HISTORY_CHAR_LIMIT = int(os.getenv("HISTORY_CHAR_LIMIT", "80000"))  # ~20k tokens
+
+# FIX #5: corrected from 80000 (~20k tokens, too large) to 60000 (~15k tokens)
+_HISTORY_CHAR_LIMIT = int(os.getenv("HISTORY_CHAR_LIMIT", "60000"))
+
+# Sentinel prefix used to pass history through the streaming generator
+# without a second LLM call. Never visible to the end user.
+_HISTORY_SENTINEL = "\x00HISTORY\x00"
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +68,23 @@ open rate, CTR, hook type, and tone. Be concise and numbers-first.
 
 Database schema:
 {get_schema()}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+SQL QUERY RULES — follow these strictly:
+
+1. LIMIT: When the user asks for top-N or any ranked list, ALWAYS add LIMIT N to the SQL.
+   Example: "top 10 campaigns" → LIMIT 10. Never omit the LIMIT clause.
+
+2. Enrichment NULLs: EmailEnrichment columns (hook_type, tone, language, etc.) may be NULL
+   for campaigns not yet classified. NEVER add WHERE e.hook_type IS NOT NULL or any similar
+   filter unless the user explicitly asks to filter by that field.
+   Use LEFT JOIN and SELECT the columns as-is; NULL values are acceptable in results.
+
+3. Always use table aliases and prefix every column: k.SubjectLine, e.hook_type etc.
+   Never use bare unqualified column names.
+
+4. Always use fully qualified table names:
+   `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase` k
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RESPONSE FORMAT — choose ONE:
@@ -190,16 +215,24 @@ def run_agent(
 
 # ---------------------------------------------------------------------------
 # Streaming agent — used by POST /chat/stream (SSE)
-# Runs tool loop synchronously, then streams final answer token-by-token.
+#
+# FIX #3: history is now passed back as a sentinel chunk at the end of the
+# generator, so api.py does NOT need to call run_agent() a second time.
+# The sentinel chunk starts with _HISTORY_SENTINEL and is never forwarded
+# to the client as a text event.
 # ---------------------------------------------------------------------------
 def run_agent_stream(
     user_message: str,
     history: list[dict] | None = None,
 ) -> Generator[str, None, None]:
     """
-    Generator yielding raw text chunks from the final LLM response.
-    Tool calls are executed silently before streaming begins.
-    The caller (FastAPI) wraps chunks in SSE format.
+    Generator yielding raw text chunks from the final LLM response,
+    followed by a single sentinel chunk containing the updated history.
+
+    Sentinel format (never shown to end user):
+        "\x00HISTORY\x00" + json.dumps(updated_history)
+
+    Tool calls are executed synchronously before streaming begins.
     """
     messages = [{"role": "system", "content": _build_system_prompt()}]
     messages.extend(_trim_history(list(history or [])))
@@ -215,10 +248,12 @@ def run_agent_stream(
         messages.append(msg)
 
         if choice["finish_reason"] != "tool_calls":
-            # Re-request the same conversation with streaming for the final answer
-            messages.pop()  # remove non-streamed assistant turn
+            # Remove the non-streamed assistant turn, re-request with streaming
+            messages.pop()
             stream_resp = _chat(messages, stream=True)
             stream_resp.raise_for_status()
+
+            streamed_content = ""
             for line in stream_resp.iter_lines():
                 if not line:
                     continue
@@ -226,13 +261,22 @@ def run_agent_stream(
                 if line.startswith("data: "):
                     line = line[6:]
                 if line == "[DONE]":
-                    return
+                    break
                 try:
-                    text = json.loads(line)["choices"][0].get("delta", {}).get("content")
+                    delta = json.loads(line)["choices"][0].get("delta", {})
+                    text = delta.get("content")
                     if text:
+                        streamed_content += text
                         yield text
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
+
+            # Append the assembled assistant message to history
+            messages.append({"role": "assistant", "content": streamed_content})
+
+            # FIX #3: yield history via sentinel — no second LLM call needed
+            updated_history = messages[1:]  # strip system prompt
+            yield _HISTORY_SENTINEL + json.dumps(updated_history, ensure_ascii=False)
             return
 
         for tc in msg.get("tool_calls", []):
@@ -243,7 +287,10 @@ def run_agent_stream(
                 "content": result,
             })
 
-    yield "\n\n_(Reached maximum tool call rounds — please rephrase.)_"
+    fallback = "\n\n_(Reached maximum tool call rounds — please rephrase.)_"
+    yield fallback
+    messages.append({"role": "assistant", "content": fallback})
+    yield _HISTORY_SENTINEL + json.dumps(messages[1:], ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
