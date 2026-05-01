@@ -283,10 +283,31 @@ OUTPUT RULES — read carefully
 8. ALWAYS alias tables (k, e, r) and prefix every column: k.SubjectLine, e.hook_type.
 9. Use LEFT JOIN for EmailEnrichment so NULL-enriched rows appear.
 10. NEVER add WHERE e.hook_type IS NOT NULL unless the user explicitly asks.
-11. STATISTICAL QUALITY GUARD — always apply to aggregations:
-    - HAVING COUNT(*) >= 10 when grouping by segment/geo/list
-    - HAVING AVG(open_rate_percent) < 80 to exclude seeded lists
-    - Label groups with 10-30 campaigns as "(low sample, n=K)"
+11. STATISTICAL QUALITY GUARD — обязательно для любой агрегации:
+    - HAVING COUNT(*) >= 20 когда группируешь по времени/дню/часу/сегменту
+    - HAVING AVG(k.open_rate_percent) < 60 — исключает seed/warmy списки
+      у которых open rate аномально высокий (>60% = не реальная аудитория)
+    - HAVING AVG(k.ctr_percent) < 50 — исключает аномальный CTR
+    Оба HAVING применяй ВМЕСТЕ с существующими WHERE фильтрами.
+12. WEEKDAY NAMES — когда в запросе упоминается день недели или лучшее время:
+    BigQuery EXTRACT(DAYOFWEEK FROM SendTime) возвращает цифры:
+    1=Sunday, 2=Monday, 3=Tuesday, 4=Wednesday,
+    5=Thursday, 6=Friday, 7=Saturday.
+    ВСЕГДА конвертируй в название через CASE:
+    CASE EXTRACT(DAYOFWEEK FROM k.SendTime)
+      WHEN 1 THEN 'Sunday'
+      WHEN 2 THEN 'Monday'
+      WHEN 3 THEN 'Tuesday'
+      WHEN 4 THEN 'Wednesday'
+      WHEN 5 THEN 'Thursday'
+      WHEN 6 THEN 'Friday'
+      WHEN 7 THEN 'Saturday'
+    END AS weekday_name
+    НИКОГДА не возвращай цифру 1-7 как weekday.
+13. MINIMUM SAMPLE SIZE — для вопросов про лучшее время/день:
+    Группируй только слоты где COUNT(*) >= 20 кампаний.
+    Сортируй по AVG open_rate_percent DESC только после применения
+    всех HAVING фильтров.
 Output JSON only. No preamble."""
 
 
@@ -310,7 +331,12 @@ RESPONSE FORMAT — pick ONE:
 
 2. ANALYTICAL (rankings, trends, top-N):
    - One headline insight sentence.
-   - ONE artifact: markdown table (≤10 rows, ≤5 cols) OR chart marker (not both).
+   - ONE artifact: markdown table (≤15 rows, ≤6 cols) OR chart marker (not both).
+     Always show breakdown rows, not just top-level aggregates.
+     When data has segments (days, hours, campaigns) — show ALL segments
+     that passed the quality filter, not just top 3.
+     If open_rate > 60% or CTR > 50% appears in results — flag it explicitly:
+     "⚠️ аномальные значения (вероятно seed-список, n=K)" и исключи из выводов.
 
 PERIOD HONESTY:
 - Say "all-time" if no date filter was applied.
