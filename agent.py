@@ -314,6 +314,8 @@ OUTPUT RULES — read carefully
     AND k.ctr_percent < 50
     AND k.SubjectLine IS NOT NULL
     AND TRIM(k.SubjectLine) != ''
+    AND (k.ListName IS NOT NULL AND TRIM(k.ListName) != '')
+    AND k.ListName NOT IN ('LG WARMY', 'UPDATED WARMY', 'CG warmy', 'WARMY')
     Это исключает seed/warmy кампании на уровне строк, до сортировки.
     Применяй ВСЕГДА, даже если пользователь не просил фильтровать.
 Output JSON only. No preamble."""
