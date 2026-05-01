@@ -174,25 +174,15 @@ def _safe(vals: list[str], idx: int, cast=str, default=None):
 # ---------------------------------------------------------------------------
 RESPONSE_STYLE = """You are a senior email-marketing analyst. Reply in the user's language.
 
-DEFAULT MODE = CONVERSATIONAL.
-Switch to ANALYTICAL only when the user EXPLICITLY asks for data:
-"top", "ranking", "compare", "distribution", "breakdown", "show table",
-"chart", "graph", "сколько", "топ", "сравни", "покажи таблицу", "график",
-"распределение", "по дням/неделям/месяцам", "average by ...", "list of ...".
+Always answer with real data. For any question about performance, timing, rankings,
+or patterns — immediately run the appropriate SQL or RAG query and respond with
+concrete numbers. Never ask clarifying questions before querying. Never give generic
+advice without data. If the user says "да" or "yes" after a question, run the query now.
 
-Greetings, opinions, clarifications, follow-ups, "what do you think",
-"explain why", "how does X work", "tell me about", "что думаешь", "объясни",
-"почему", "расскажи", "давай поговорим", or any message under ~6 words
-without an explicit data verb → CONVERSATIONAL, no exceptions.
-
-In CONVERSATIONAL mode it is FORBIDDEN to emit:
-  - markdown tables, bullet/numbered lists
-  - <<<CHART...>>> markers, code blocks
-Only 1–3 short sentences of plain prose.
-
-ANALYTICAL mode:
-  - One headline sentence, then ONE artifact (table OR chart, not both).
+When presenting results:
+  - One headline insight sentence, then ONE artifact: markdown table OR chart marker.
   - Tables ≤ 10 rows, ≤ 5 columns. Charts ≤ 20 points.
+  - Never produce both a table and a chart in the same reply.
 
 DATA HYGIENE — NON-NEGOTIABLE for every SQL query you generate:
   - Always exclude warmup/seed lists:
@@ -212,7 +202,7 @@ PERIOD HONESTY:
   - Do NOT invent dates. Do NOT emit a <<<PERIOD>>> marker — the server
     fills period metadata from the actual SQL, not from your text.
 
-CHART MARKER (analytical only, optional):
+CHART MARKER (optional):
 <<<CHART{"type":"bar","title":"...","data":[...],"x_key":"...","y_key":"..."}>>>
 type ∈ {"bar","line","pie"}. Exactly one chart per reply or none."""
 
@@ -226,42 +216,9 @@ _RANGE_MAP: dict[str, int] = {
 }
 
 # ---------------------------------------------------------------------------
-# Intent classifier
+# Period marker cleanup
 # ---------------------------------------------------------------------------
-_ANALYTICAL_TRIGGERS = re.compile(
-    r"\b(top|ranking|compare|comparison|distribution|breakdown|table|chart|graph|"
-    r"average\s+by|list\s+of|how\s+many|count\s+of|"
-    r"топ|сравни|сравнение|распределени|таблиц|график|диаграмм|"
-    r"сколько|посчита|по\s+(дн|недел|месяц|кварта)|средн\w*\s+по)\b",
-    re.IGNORECASE,
-)
-
-def _is_conversational(message: str) -> bool:
-    msg = (message or "").strip()
-    if _ANALYTICAL_TRIGGERS.search(msg):
-        return False
-    if len(msg.split()) <= 5:
-        return True
-    return len(msg) < 80
-
-# ---------------------------------------------------------------------------
-# Prose sanitizer (safety net for conversational mode)
-# ---------------------------------------------------------------------------
-_TABLE_LINE  = re.compile(r"^\s*\|.*\|\s*$", re.MULTILINE)
-_LIST_LINE   = re.compile(r"^\s*([-*+]|\d+\.)\s+", re.MULTILINE)
-_CODE_BLOCK  = re.compile(r"```.*?```", re.DOTALL)
-_CHART_MARK  = re.compile(r"<<<CHART\{.*?\}>>>", re.DOTALL)
 _PERIOD_MARK = re.compile(r"<<<PERIOD\{.*?\}>>>", re.DOTALL)
-
-def _strip_to_prose(reply: str) -> str:
-    reply = _CODE_BLOCK.sub("", reply)
-    reply = _CHART_MARK.sub("", reply)
-    reply = _PERIOD_MARK.sub("", reply)
-    reply = _TABLE_LINE.sub("", reply)
-    reply = _LIST_LINE.sub("", reply)
-    reply = re.sub(r"\n{2,}", "\n", reply).strip()
-    sentences = re.split(r"(?<=[.!?])\s+", reply)
-    return " ".join(sentences[:3]).strip()
 
 def _drop_period_marker(reply: str) -> str:
     return _PERIOD_MARK.sub("", reply).strip()
@@ -293,7 +250,7 @@ def _reply_mentions_period(reply: str) -> bool:
 # ---------------------------------------------------------------------------
 # Augment message with RESPONSE_STYLE + directives
 # ---------------------------------------------------------------------------
-def _augment(message: str, filters: dict[str, Any], conv: bool) -> str:
+def _augment(message: str, filters: dict[str, Any]) -> str:
     directives: list[str] = []
     range_val = str(filters.get("range") or filters.get("date_range") or "").lower()
     if range_val in _RANGE_MAP:
@@ -314,13 +271,8 @@ def _augment(message: str, filters: dict[str, Any], conv: bool) -> str:
         "AND EmailsSent >= 500."
     )
     directive_block = "\n".join(f"- {d}" for d in directives)
-    mode_hint = (
-        "CURRENT MODE: CONVERSATIONAL — prose only, no tables/lists/charts."
-        if conv else
-        "CURRENT MODE: ANALYTICAL allowed if the data justifies it."
-    )
     return (
-        f"{RESPONSE_STYLE}\n\n{mode_hint}\n\n"
+        f"{RESPONSE_STYLE}\n\n"
         f"USER FILTER DIRECTIVES:\n{directive_block}\n\n"
         f"USER MESSAGE:\n{message}"
     )
@@ -478,24 +430,17 @@ def chat(req: ChatRequest):
         range_val = str((req.filters or {}).get("range") or (req.filters or {}).get("date_range") or "").lower()
         period_days: int | None = _RANGE_MAP.get(range_val)
 
-        conv = _is_conversational(req.message)
-        augmented = _augment(req.message, req.filters or {}, conv)
+        augmented = _augment(req.message, req.filters or {})
 
         reply, updated_history = run_agent(augmented, req.history or None)
         reply, chart = _extract_chart(reply)
-        reply = _drop_period_marker(reply)   # ignore model-supplied period
-
-        # Conversational hard-strip
-        if conv:
-            reply = _strip_to_prose(reply)
-            chart = None
+        reply = _drop_period_marker(reply)
 
         # Deterministic period metadata
         period: DataPeriod | None = None
         if period_days:
             period = _compute_period(period_days)
-        elif not conv and _reply_mentions_period(reply):
-            # Reply claims a timeframe but no filter was set → mark unverified
+        elif _reply_mentions_period(reply):
             period = DataPeriod(label="unverified", from_=None, to=None, rows=None)
 
         return ChatResponse(
@@ -534,8 +479,7 @@ async def _sse_generator(req: ChatRequest) -> AsyncGenerator[str, None]:
     range_val = str((req.filters or {}).get("range") or (req.filters or {}).get("date_range") or "").lower()
     period_days: int | None = _RANGE_MAP.get(range_val)
 
-    conv = _is_conversational(req.message)
-    augmented  = _augment(req.message, req.filters or {}, conv)
+    augmented  = _augment(req.message, req.filters or {})
     full_reply = ""
     history_data: list | None = None
 
@@ -559,15 +503,11 @@ async def _sse_generator(req: ChatRequest) -> AsyncGenerator[str, None]:
         clean, chart = _extract_chart(full_reply)
         clean = _drop_period_marker(clean)
 
-        if conv:
-            clean = _strip_to_prose(clean)
-            chart = None
-
         # Deterministic period
         period: DataPeriod | None = None
         if period_days:
             period = _compute_period(period_days)
-        elif not conv and _reply_mentions_period(clean):
+        elif _reply_mentions_period(clean):
             period = DataPeriod(label="unverified", from_=None, to=None, rows=None)
 
         if chart:
