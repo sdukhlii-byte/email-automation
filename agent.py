@@ -30,9 +30,8 @@ import re
 import time
 from typing import Generator
 
-import dateparser
-import redis as redis_lib
 import requests
+import dateparser
 
 from bigquery_tools import SQL_TOOL_SPEC, get_schema, run_sql
 from rag_tools import RAG_TOOL_SPEC, rag_search
@@ -51,68 +50,38 @@ _HISTORY_SENTINEL = "\x00HISTORY\x00"
 
 
 # ===========================================================================
-# CHANGE 3 — Redis-backed response cache (TTL configurable, default 1 h)
+# CHANGE 3 — In-memory response cache (TTL configurable, default 1 h)
 # ===========================================================================
 class _ResponseCache:
     """
-    Redis-backed response cache.
+    Thread-unsafe single-process cache.
     Key   = SHA-256 of normalised question (first 16 hex chars)
-    Value = JSON-serialised {"reply": str, "history": list}
-    TTL   = CACHE_TTL seconds (default 3600)
+    Value = (timestamp_float, reply_str, history_list)
+    TTL   = 3600 s by default; override with env CACHE_TTL
     """
     TTL = int(os.getenv("CACHE_TTL", "3600"))
 
     def __init__(self) -> None:
-        url = os.environ.get("REDIS_URL")
-        if url:
-            self._r = redis_lib.from_url(url, decode_responses=True)
-            log.info("Redis cache connected: %s", url.split("@")[-1])
-        else:
-            self._r = None
-            log.warning("REDIS_URL not set — cache disabled")
+        self._store: dict[str, tuple[float, str, list]] = {}
 
     def _key(self, normalised: str) -> str:
-        return "agentcache:" + hashlib.sha256(
-            normalised.encode()
-        ).hexdigest()[:16]
+        return hashlib.sha256(normalised.encode()).hexdigest()[:16]
 
     def get(self, normalised: str) -> tuple[str, list] | None:
-        if self._r is None:
-            return None
-        try:
-            raw = self._r.get(self._key(normalised))
-            if raw:
-                data = json.loads(raw)
-                log.info("Cache HIT key=%s", self._key(normalised))
-                return data["reply"], data["history"]
-        except Exception as e:
-            log.warning("Cache GET error: %s", e)
+        k = self._key(normalised)
+        entry = self._store.get(k)
+        if entry and time.time() - entry[0] < self.TTL:
+            log.info("Cache HIT key=%s", k)
+            return entry[1], entry[2]
         return None
 
     def set(self, normalised: str, reply: str, history: list) -> None:
-        if self._r is None:
-            return
-        try:
-            k = self._key(normalised)
-            self._r.setex(
-                k,
-                self.TTL,
-                json.dumps(
-                    {"reply": reply, "history": history},
-                    ensure_ascii=False
-                ),
-            )
-            log.info("Cache SET key=%s ttl=%ds", k, self.TTL)
-        except Exception as e:
-            log.warning("Cache SET error: %s", e)
+        k = self._key(normalised)
+        self._store[k] = (time.time(), reply, history)
+        log.info("Cache SET key=%s", k)
 
     def invalidate(self, normalised: str) -> None:
-        if self._r is None:
-            return
-        try:
-            self._r.delete(self._key(normalised))
-        except Exception as e:
-            log.warning("Cache INVALIDATE error: %s", e)
+        self._store.pop(self._key(normalised), None)
 
 
 _cache = _ResponseCache()
@@ -158,7 +127,20 @@ _FILLER = re.compile(
 )
 
 
+_DATE_HINTS = re.compile(
+    r"\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}|\d{4}-\d{2}-\d{2}|"
+    r"january|february|march|april|may|june|july|august|"
+    r"september|october|november|december|"
+    r"январ|феврал|март|апрел|май|июн|июл|август|"
+    r"сентябр|октябр|ноябр|декабр)\b",
+    re.IGNORECASE,
+)
+
+
 def _normalise_dates(q: str) -> str:
+    # Only run dateparser when the question contains an explicit date hint
+    if not _DATE_HINTS.search(q):
+        return q
     words = q.split()
     result = []
     i = 0
@@ -166,6 +148,8 @@ def _normalise_dates(q: str) -> str:
         replaced = False
         for length in (3, 2):
             chunk = " ".join(words[i:i+length])
+            if not _DATE_HINTS.search(chunk):
+                continue
             parsed = dateparser.parse(chunk, settings={
                 "RETURN_AS_TIMEZONE_AWARE": False,
                 "PREFER_DAY_OF_MONTH": "first",
@@ -186,7 +170,8 @@ def _normalise_question(question: str) -> str:
     1. Strip + lowercase
     2. Remove filler phrases
     3. Substitute synonyms
-    4. Collapse whitespace
+    4. Normalise dates
+    5. Collapse whitespace
     """
     q = question.strip().lower()
     q = _FILLER.sub("", q)
@@ -473,6 +458,9 @@ def _run_sql_then_interpret(normalised_q: str, original_message: str) -> str | N
     # ---- Phase 2: BigQuery execution ----
     bq_result = run_sql(sql)
     log.info("BQ result: %d chars", len(bq_result))
+    if bq_result.startswith("ERROR:"):
+        log.warning("BQ execution error — falling through: %s", bq_result[:200])
+        return None
 
     # ---- Phase 3: Interpretation ----
     interp_messages = [
@@ -648,7 +636,7 @@ def run_agent_stream(
             # Remove the non-streamed assistant turn, re-request with streaming
             messages.pop()
             # Use interpretation call for the final streamed answer
-            stream_resp = _chat(messages, stream=True)
+            stream_resp = _chat_interp(messages, stream=True)
             stream_resp.raise_for_status()
 
             streamed_content = ""
