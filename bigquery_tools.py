@@ -23,6 +23,7 @@ WHY CTE WRAPPER:
   it is guaranteed to apply exactly once, regardless of query shape.
 """
 
+import functools
 import json
 import logging
 import os
@@ -69,6 +70,7 @@ def get_bq_client() -> bigquery.Client:
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
+@functools.lru_cache(maxsize=1)
 def get_schema() -> str:
     return """
 Available tables in x-fabric-494718-d1.datasetmailchimp:
