@@ -10,3 +10,5 @@ pyarrow>=15.0.0
 db-dtypes>=1.2.0
 plotly
 openpyxl
+fastapi>=0.111.0
+uvicorn>=0.29.0
