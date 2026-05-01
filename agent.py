@@ -2,6 +2,9 @@
 Email Marketing Agent
 Orchestrates sql_tool and rag_tool via OpenAI function calling.
 Stateless — caller manages conversation history.
+
+v3: Streamlit dependency removed. Only run_agent (sync) is kept.
+    run_agent_stream is now a true line-by-line SSE generator for FastAPI.
 """
 
 import json
@@ -16,25 +19,73 @@ from rag_tools import RAG_TOOL_SPEC, rag_search
 
 log = logging.getLogger(__name__)
 
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-AGENT_MODEL    = os.getenv("AGENT_MODEL", "gpt-4o-mini")
-MAX_TOOL_ROUNDS = 5  # prevent infinite loops
+OPENAI_API_KEY   = os.environ["OPENAI_API_KEY"]
+AGENT_MODEL      = os.getenv("AGENT_MODEL", "gpt-4o-mini")
+MAX_TOOL_ROUNDS  = int(os.getenv("MAX_TOOL_ROUNDS", "6"))
+MAX_HISTORY_MSGS = int(os.getenv("MAX_HISTORY_MSGS", "20"))
+_HISTORY_CHAR_LIMIT = int(os.getenv("HISTORY_CHAR_LIMIT", "80000"))  # ~20k tokens
 
-SYSTEM_PROMPT = f"""You are an expert email marketing analyst with access to a database \
-of Mailchimp email campaigns including their content, performance metrics, and AI-generated \
-classifications (hook type, tone, angle, language, geo).
+
+# ---------------------------------------------------------------------------
+# History trimming
+# ---------------------------------------------------------------------------
+def _trim_history(history: list[dict]) -> list[dict]:
+    """Keep conversation within token budget.
+    Always preserves the first message, drops oldest pairs when over limit."""
+    if not history:
+        return history
+    if len(history) > MAX_HISTORY_MSGS:
+        history = [history[0]] + history[-(MAX_HISTORY_MSGS - 1):]
+    while len(history) > 2:
+        if sum(len(json.dumps(m)) for m in history) <= _HISTORY_CHAR_LIMIT:
+            break
+        history = [history[0]] + history[3:]
+    return history
+
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+def _build_system_prompt() -> str:
+    return f"""You are an expert email marketing analyst with access to a Mailchimp \
+campaigns database including content, performance metrics, and AI classifications \
+(hook type, tone, angle, language, geo).
 
 You have two tools:
 1. sql_tool — for aggregations, rankings, trends, metric comparisons
-2. rag_tool — for finding semantically similar campaigns, examples by topic or style
+2. rag_tool — for finding semantically similar campaigns by topic or style
 
-Always ground your answers in real data from the tools. When showing campaigns, \
-include subject line, open rate, CTR, hook type, and tone. \
-Be concise and numbers-first. If a question requires both tools, use both.
+Always ground your answers in real data. When showing campaigns, include subject line, \
+open rate, CTR, hook type, and tone. Be concise and numbers-first.
 
 Database schema:
 {get_schema()}
-"""
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+RESPONSE FORMAT — choose ONE:
+
+1. CONVERSATIONAL (greetings, clarifications, single facts, opinions):
+   - Plain prose, max 3 short sentences. No tables, no chart marker.
+
+2. ANALYTICAL (rankings, comparisons, distributions, top-N, trends):
+   - One headline insight sentence.
+   - Then ONE artifact: markdown table OR chart marker (never both unless asked).
+   - Tables: GitHub markdown, ≤10 rows, ≤5 columns.
+
+PERIOD HONESTY:
+- If you mention a timeframe, the SQL MUST have a matching WHERE SendTime >= TIMESTAMP_SUB(...).
+- If no date filter: say "all-time", never imply a period.
+- Append on its own line:
+  <<<PERIOD{{"from":"YYYY-MM-DD","to":"YYYY-MM-DD","rows":N,"label":"last 7 days"}}>>>
+  (Use null values when no date filter applied.)
+
+CHART MARKER (analytical only, optional):
+<<<CHART{{"type":"bar","title":"...","data":[...],"x_key":"...","y_key":"..."}}>>>
+- type: "bar" | "line" | "pie". Max 20 data points.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Reply in the user's language."""
+
 
 TOOLS = [SQL_TOOL_SPEC, RAG_TOOL_SPEC]
 
@@ -43,23 +94,21 @@ TOOLS = [SQL_TOOL_SPEC, RAG_TOOL_SPEC]
 # OpenAI chat call
 # ---------------------------------------------------------------------------
 def _chat(messages: list[dict], stream: bool = False) -> requests.Response:
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": AGENT_MODEL,
-        "messages": messages,
-        "tools": TOOLS,
-        "tool_choice": "auto",
-        "temperature": 0.2,
-        "max_tokens": 2000,
-        "stream": stream,
-    }
     return requests.post(
         "https://api.openai.com/v1/chat/completions",
-        headers=headers,
-        json=payload,
+        headers={
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": AGENT_MODEL,
+            "messages": messages,
+            "tools": TOOLS,
+            "tool_choice": "auto",
+            "temperature": 0.2,
+            "max_tokens": 2000,
+            "stream": stream,
+        },
         timeout=120,
         stream=stream,
     )
@@ -72,7 +121,7 @@ def _dispatch_tool(name: str, arguments: str) -> str:
     try:
         args = json.loads(arguments)
     except json.JSONDecodeError:
-        return f"ERROR: Invalid tool arguments JSON: {arguments[:200]}"
+        return f"ERROR: Invalid JSON arguments: {arguments[:200]}"
 
     if name == "sql_tool":
         query = args.get("query", "")
@@ -90,85 +139,74 @@ def _dispatch_tool(name: str, arguments: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Agent run — single turn, returns final text
+# Non-streaming agent — used by POST /chat
 # ---------------------------------------------------------------------------
 def run_agent(
     user_message: str,
     history: list[dict] | None = None,
 ) -> tuple[str, list[dict]]:
     """
-    Runs the agent for one user turn.
-
-    Args:
-        user_message: The user's question.
-        history: Previous conversation messages (excluding system prompt).
-
-    Returns:
-        (assistant_reply, updated_history)
+    Run the agent for one user turn.
+    Returns (reply_text, updated_history_without_system_prompt).
     """
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    if history:
-        messages.extend(history)
+    messages = [{"role": "system", "content": _build_system_prompt()}]
+    messages.extend(_trim_history(list(history or [])))
     messages.append({"role": "user", "content": user_message})
 
-    for round_num in range(MAX_TOOL_ROUNDS):
+    last_content = ""
+
+    for round_num in range(1, MAX_TOOL_ROUNDS + 1):
+        log.info("Agent round %d/%d", round_num, MAX_TOOL_ROUNDS)
         resp = _chat(messages)
         resp.raise_for_status()
-        data = resp.json()
-
+        data    = resp.json()
         choice  = data["choices"][0]
         message = choice["message"]
         messages.append(message)
 
-        # No tool calls → final answer
+        content = message.get("content") or ""
+        if content:
+            last_content = content
+
         if choice["finish_reason"] != "tool_calls":
-            reply = message.get("content") or ""
-            # Return history without system prompt
-            updated_history = messages[1:]
-            return reply, updated_history
+            return content, messages[1:]  # strip system prompt from history
 
-        # Execute each tool call
-        for tool_call in message.get("tool_calls", []):
-            tool_name   = tool_call["function"]["name"]
-            tool_args   = tool_call["function"]["arguments"]
-            tool_result = _dispatch_tool(tool_name, tool_args)
-            log.info("Tool %s → %d chars result", tool_name, len(tool_result))
+        tool_calls = message.get("tool_calls", [])
+        log.info("Round %d: %d tool call(s): %s", round_num, len(tool_calls),
+                 [tc["function"]["name"] for tc in tool_calls])
 
+        for tc in tool_calls:
+            result = _dispatch_tool(tc["function"]["name"], tc["function"]["arguments"])
+            log.info("  → %s: %d chars", tc["function"]["name"], len(result))
             messages.append({
                 "role": "tool",
-                "tool_call_id": tool_call["id"],
-                "content": tool_result,
+                "tool_call_id": tc["id"],
+                "content": result,
             })
 
-    # Fallback if max rounds hit
-    return "Reached maximum tool call rounds. Please rephrase your question.", messages[1:]
+    log.warning("Hit MAX_TOOL_ROUNDS=%d", MAX_TOOL_ROUNDS)
+    return last_content or "Reached maximum tool call rounds. Please rephrase.", messages[1:]
 
 
 # ---------------------------------------------------------------------------
-# Streaming variant (for Streamlit)
+# Streaming agent — used by POST /chat/stream (SSE)
+# Runs tool loop synchronously, then streams final answer token-by-token.
 # ---------------------------------------------------------------------------
 def run_agent_stream(
     user_message: str,
     history: list[dict] | None = None,
-) -> Generator[str, None, list[dict]]:
+) -> Generator[str, None, None]:
     """
-    Generator that yields text chunks as they stream, then returns updated history.
-    Tool calls are executed silently before streaming the final answer.
-
-    Usage in Streamlit:
-        reply = ""
-        for chunk in run_agent_stream(question, history):
-            reply += chunk
-            placeholder.markdown(reply)
+    Generator yielding raw text chunks from the final LLM response.
+    Tool calls are executed silently before streaming begins.
+    The caller (FastAPI) wraps chunks in SSE format.
     """
-    # First run tools (non-streaming) to get final messages
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    if history:
-        messages.extend(history)
+    messages = [{"role": "system", "content": _build_system_prompt()}]
+    messages.extend(_trim_history(list(history or [])))
     messages.append({"role": "user", "content": user_message})
 
     # Tool loop (non-streaming)
-    for _ in range(MAX_TOOL_ROUNDS):
+    for round_num in range(1, MAX_TOOL_ROUNDS + 1):
         resp = _chat(messages, stream=False)
         resp.raise_for_status()
         data   = resp.json()
@@ -177,26 +215,35 @@ def run_agent_stream(
         messages.append(msg)
 
         if choice["finish_reason"] != "tool_calls":
-            # Stream the final answer
-            final_text = msg.get("content") or ""
-            # Yield in ~50-char chunks to simulate streaming
-            chunk_size = 50
-            for i in range(0, len(final_text), chunk_size):
-                yield final_text[i : i + chunk_size]
+            # Re-request the same conversation with streaming for the final answer
+            messages.pop()  # remove non-streamed assistant turn
+            stream_resp = _chat(messages, stream=True)
+            stream_resp.raise_for_status()
+            for line in stream_resp.iter_lines():
+                if not line:
+                    continue
+                line = line.decode("utf-8") if isinstance(line, bytes) else line
+                if line.startswith("data: "):
+                    line = line[6:]
+                if line == "[DONE]":
+                    return
+                try:
+                    text = json.loads(line)["choices"][0].get("delta", {}).get("content")
+                    if text:
+                        yield text
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
             return
 
-        for tool_call in msg.get("tool_calls", []):
-            result = _dispatch_tool(
-                tool_call["function"]["name"],
-                tool_call["function"]["arguments"],
-            )
+        for tc in msg.get("tool_calls", []):
+            result = _dispatch_tool(tc["function"]["name"], tc["function"]["arguments"])
             messages.append({
                 "role": "tool",
-                "tool_call_id": tool_call["id"],
+                "tool_call_id": tc["id"],
                 "content": result,
             })
 
-    yield "Reached maximum tool call rounds."
+    yield "\n\n_(Reached maximum tool call rounds — please rephrase.)_"
 
 
 # ---------------------------------------------------------------------------
@@ -205,9 +252,7 @@ def run_agent_stream(
 if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-
-    question = " ".join(sys.argv[1:]) or "What are the top 5 campaigns by open rate?"
-    print(f"\nQuestion: {question}\n")
-
+    question = " ".join(sys.argv[1:]) or "Top 5 campaigns by open rate?"
+    print(f"\nQ: {question}\n")
     reply, _ = run_agent(question)
-    print(f"Answer:\n{reply}")
+    print(f"A:\n{reply}")
