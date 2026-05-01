@@ -32,6 +32,21 @@ Always ground your answers in real data from the tools. When showing campaigns, 
 include subject line, open rate, CTR, hook type, and tone. \
 Be concise and numbers-first. If a question requires both tools, use both.
 
+GEO NORMALIZATION RULE — always apply when grouping or filtering by country/geo:
+The `geo` column in EmailEnrichment contains inconsistent values that must be normalized \
+before grouping. Always wrap `geo` with this CASE expression:
+  CASE UPPER(TRIM(geo))
+    WHEN 'LT'        THEN 'Lithuania'
+    WHEN 'LITHUANIA' THEN 'Lithuania'
+    WHEN 'ES'        THEN 'Spain'
+    WHEN 'SPAIN'     THEN 'Spain'
+    WHEN 'GB'        THEN 'United Kingdom'
+    WHEN 'UNITED KINGDOM' THEN 'United Kingdom'
+    WHEN 'GLOBAL'    THEN 'Global'
+    ELSE INITCAP(TRIM(geo))
+  END AS geo_normalized
+Then GROUP BY geo_normalized, never by raw `geo`.
+
 Database schema:
 {get_schema()}
 """
