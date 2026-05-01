@@ -64,7 +64,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Email Intelligence API", version="4.1.0")
+app = FastAPI(title="Email Intelligence API", version="4.0.0")
 
 # Allow all origins — restrict to your Lovable domain in production:
 # allow_origins=["https://your-app.lovable.app"]
@@ -86,11 +86,12 @@ class ChatRequest(BaseModel):
 
 
 class ChartData(BaseModel):
-    type: str
+    type: str        # "bar" | "line" | "pie"
     title: str
     data: list[dict]
     x_key: str = ""
     y_key: str = ""
+
 
 class DataPeriod(BaseModel):
     from_: str | None = None
@@ -100,6 +101,7 @@ class DataPeriod(BaseModel):
 
     class Config:
         fields = {"from_": "from"}
+
 
 class ChatResponse(BaseModel):
     reply: str
@@ -170,44 +172,7 @@ def _safe(vals: list[str], idx: int, cast=str, default=None):
 
 
 # ---------------------------------------------------------------------------
-# RESPONSE_STYLE system prompt
-# ---------------------------------------------------------------------------
-RESPONSE_STYLE = """You are a senior email-marketing analyst. Reply in the user's language.
-
-Always answer with real data. For any question about performance, timing, rankings,
-or patterns — immediately run the appropriate SQL or RAG query and respond with
-concrete numbers. Never ask clarifying questions before querying. Never give generic
-advice without data. If the user says "да" or "yes" after a question, run the query now.
-
-When presenting results:
-  - One headline insight sentence, then ONE artifact: markdown table OR chart marker.
-  - Tables ≤ 10 rows, ≤ 5 columns. Charts ≤ 20 points.
-  - Never produce both a table and a chart in the same reply.
-
-DATA HYGIENE — NON-NEGOTIABLE for every SQL query you generate:
-  - Always exclude warmup/seed lists:
-        AND UPPER(IFNULL(ListName,'')) NOT LIKE '%WARMY%'
-  - Always require minimum volume:
-        AND EmailsSent >= 500
-  - Treat any group with COUNT(*) < 5 as "low sample" — either skip it
-    or label it explicitly "(low sample, n=K)" in the answer.
-  - BigQuery DAYOFWEEK is 1=Sunday, 2=Monday, 3=Tuesday, 4=Wednesday,
-    5=Thursday, 6=Friday, 7=Saturday. Never invert this mapping.
-  - Hours are in UTC unless the user asks for a different timezone.
-
-PERIOD HONESTY:
-  - If the user (or filter directives) specify a period, your SQL MUST
-    contain a matching WHERE SendTime >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),
-    INTERVAL N DAY).
-  - Do NOT invent dates. Do NOT emit a <<<PERIOD>>> marker — the server
-    fills period metadata from the actual SQL, not from your text.
-
-CHART MARKER (optional):
-<<<CHART{"type":"bar","title":"...","data":[...],"x_key":"...","y_key":"..."}>>>
-type ∈ {"bar","line","pie"}. Exactly one chart per reply or none."""
-
-# ---------------------------------------------------------------------------
-# Range map
+# Filter → directive block
 # ---------------------------------------------------------------------------
 _RANGE_MAP: dict[str, int] = {
     "7d": 7,  "last_7d": 7,  "week": 7,
@@ -215,76 +180,67 @@ _RANGE_MAP: dict[str, int] = {
     "90d": 90, "quarter": 90,
 }
 
-# ---------------------------------------------------------------------------
-# Period marker cleanup
-# ---------------------------------------------------------------------------
-_PERIOD_MARK = re.compile(r"<<<PERIOD\{.*?\}>>>", re.DOTALL)
 
-def _drop_period_marker(reply: str) -> str:
-    return _PERIOD_MARK.sub("", reply).strip()
-
-# ---------------------------------------------------------------------------
-# Deterministic period computation
-# ---------------------------------------------------------------------------
-def _compute_period(days: int | None, rows: int | None = None) -> "DataPeriod | None":
-    if not days:
-        return None
-    now  = datetime.now(timezone.utc)
-    frm  = (now - timedelta(days=days)).date().isoformat()
-    return DataPeriod(
-        from_=frm,
-        to=now.date().isoformat(),
-        rows=rows,
-        label=f"last {days} days",
-    )
-
-# Detect when model reply mentions a timeframe (for unverified period warning)
-_PERIOD_HINT = re.compile(
-    r"(last\s+\d+\s+(day|days|week|weeks|month|months)|"
-    r"за\s+(последн\w+\s+)?(\d+\s+)?(дн|недел|месяц|кварта))",
-    re.IGNORECASE,
-)
-def _reply_mentions_period(reply: str) -> bool:
-    return bool(_PERIOD_HINT.search(reply or ""))
-
-# ---------------------------------------------------------------------------
-# Augment message with RESPONSE_STYLE + directives
-# ---------------------------------------------------------------------------
-def _augment(message: str, filters: dict[str, Any]) -> str:
-    directives: list[str] = []
+def _build_filter_directive(filters: dict[str, Any]) -> str:
+    if not filters:
+        return ""
+    lines: list[str] = []
     range_val = str(filters.get("range") or filters.get("date_range") or "").lower()
     if range_val in _RANGE_MAP:
         days = _RANGE_MAP[range_val]
-        directives.append(
-            f"Restrict every SQL with WHERE SendTime >= "
+        lines.append(
+            f"Restrict every SQL query: WHERE SendTime >= "
             f"TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY). "
             f"Refer to this period as 'last {days} days'."
         )
     extras = {k: v for k, v in filters.items() if k not in ("range", "date_range") and v}
     if extras:
-        directives.append(
-            "Apply these filters as SQL WHERE clauses: "
+        lines.append(
+            "Also apply these filters as SQL WHERE clauses: "
             + ", ".join(f"{k}={v!r}" for k, v in extras.items())
         )
-    directives.append(
-        "Always include: AND UPPER(IFNULL(ListName,'')) NOT LIKE '%WARMY%' "
-        "AND EmailsSent >= 500."
-    )
-    directive_block = "\n".join(f"- {d}" for d in directives)
+    return "\n".join(f"- {l}" for l in lines)
+
+
+def _augment(message: str, filters: dict[str, Any]) -> str:
+    directive = _build_filter_directive(filters)
+    if not directive:
+        return message
     return (
-        f"{RESPONSE_STYLE}\n\n"
-        f"USER FILTER DIRECTIVES:\n{directive_block}\n\n"
-        f"USER MESSAGE:\n{message}"
+        f"[ANALYST DIRECTIVES — apply to all SQL in this turn]\n"
+        f"{directive}\n\n"
+        f"[USER MESSAGE]\n{message}"
     )
 
 
 # ---------------------------------------------------------------------------
-# Chart extraction from reply text
+# Deterministic period resolution from filters
+#
+# FIX замечания 1+2: data_period больше не берётся от модели когда фильтр
+# задан явно. Модель галлюцинирует from/to и иногда не ставит маркер вовсе.
+# Сервер знает точный диапазон из filters["range"] — вычисляем детерминированно.
+# Маркер из ответа модели используется только если filters пустые (all-time).
 # ---------------------------------------------------------------------------
-_CHART_PATTERN = re.compile(r"<<<CHART(\{.*?\})>>>", re.DOTALL)
+def _resolve_period_from_filters(filters: dict[str, Any]) -> "DataPeriod | None":
+    range_val = str(filters.get("range") or filters.get("date_range") or "").lower()
+    days = _RANGE_MAP.get(range_val)
+    if not days:
+        return None
+    now   = datetime.now(timezone.utc)
+    from_ = (now - timedelta(days=days)).strftime("%Y-%m-%d")
+    to    = now.strftime("%Y-%m-%d")
+    label = f"last {days} days"
+    return DataPeriod(from_=from_, to=to, label=label)
 
 
-def _extract_chart(reply: str) -> tuple[str, "ChartData | None"]:
+# ---------------------------------------------------------------------------
+# Reply post-processing
+# ---------------------------------------------------------------------------
+_CHART_PATTERN  = re.compile(r"<<<CHART(\{.*?\})>>>",  re.DOTALL)
+_PERIOD_PATTERN = re.compile(r"<<<PERIOD(\{.*?\})>>>", re.DOTALL)
+
+
+def _extract_chart(reply: str) -> tuple[str, ChartData | None]:
     m = _CHART_PATTERN.search(reply)
     if not m:
         return reply, None
@@ -296,12 +252,27 @@ def _extract_chart(reply: str) -> tuple[str, "ChartData | None"]:
         return clean, None
 
 
+def _extract_period(reply: str) -> tuple[str, DataPeriod | None]:
+    m = _PERIOD_PATTERN.search(reply)
+    if not m:
+        return reply, None
+    clean = (reply[:m.start()] + reply[m.end():]).strip()
+    try:
+        raw = json.loads(m.group(1))
+        if "from" in raw:
+            raw["from_"] = raw.pop("from")
+        return clean, DataPeriod(**raw)
+    except Exception as e:
+        log.warning("Period parse error: %s", e)
+        return clean, None
+
+
 # ---------------------------------------------------------------------------
 # GET /health
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "4.1.0"}
+    return {"status": "ok", "version": "4.0.0"}
 
 
 # ---------------------------------------------------------------------------
@@ -425,30 +396,11 @@ def get_sync_status():
 def chat(req: ChatRequest):
     try:
         from agent import run_agent
-
-        # Determine intent and period_days from filters
-        range_val = str((req.filters or {}).get("range") or (req.filters or {}).get("date_range") or "").lower()
-        period_days: int | None = _RANGE_MAP.get(range_val)
-
-        augmented = _augment(req.message, req.filters or {})
-
-        reply, updated_history = run_agent(augmented, req.history or None)
-        reply, chart = _extract_chart(reply)
-        reply = _drop_period_marker(reply)
-
-        # Deterministic period metadata
-        period: DataPeriod | None = None
-        if period_days:
-            period = _compute_period(period_days)
-        elif _reply_mentions_period(reply):
-            period = DataPeriod(label="unverified", from_=None, to=None, rows=None)
-
-        return ChatResponse(
-            reply=reply,
-            history=updated_history,
-            chart=chart,
-            data_period=period,
-        )
+        augmented = _augment(req.message, req.filters)
+        reply, history = run_agent(augmented, req.history or None)
+        reply, chart   = _extract_chart(reply)
+        reply, period  = _extract_period(reply)
+        return ChatResponse(reply=reply, history=history, chart=chart, data_period=period)
     except Exception as e:
         log.error("Chat error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -476,10 +428,7 @@ async def _sse_generator(req: ChatRequest) -> AsyncGenerator[str, None]:
     import asyncio
     from agent import run_agent_stream
 
-    range_val = str((req.filters or {}).get("range") or (req.filters or {}).get("date_range") or "").lower()
-    period_days: int | None = _RANGE_MAP.get(range_val)
-
-    augmented  = _augment(req.message, req.filters or {})
+    augmented  = _augment(req.message, req.filters)
     full_reply = ""
     history_data: list | None = None
 
@@ -488,6 +437,7 @@ async def _sse_generator(req: ChatRequest) -> AsyncGenerator[str, None]:
 
     try:
         for chunk in run_agent_stream(augmented, req.history or None):
+            # FIX #3: intercept the sentinel history chunk — never forward to client
             if chunk.startswith(_HISTORY_SENTINEL):
                 try:
                     history_data = json.loads(chunk[len(_HISTORY_SENTINEL):])
@@ -499,16 +449,9 @@ async def _sse_generator(req: ChatRequest) -> AsyncGenerator[str, None]:
             yield _evt({"type": "chunk", "text": chunk})
             await asyncio.sleep(0)
 
-        # Post-process
-        clean, chart = _extract_chart(full_reply)
-        clean = _drop_period_marker(clean)
-
-        # Deterministic period
-        period: DataPeriod | None = None
-        if period_days:
-            period = _compute_period(period_days)
-        elif _reply_mentions_period(clean):
-            period = DataPeriod(label="unverified", from_=None, to=None, rows=None)
+        # Post-process extracted metadata
+        clean, chart  = _extract_chart(full_reply)
+        clean, period = _extract_period(clean)
 
         if chart:
             yield _evt({"type": "chart", "data": chart.dict()})
