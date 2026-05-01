@@ -214,6 +214,26 @@ def _augment(message: str, filters: dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Deterministic period resolution from filters
+#
+# FIX замечания 1+2: data_period больше не берётся от модели когда фильтр
+# задан явно. Модель галлюцинирует from/to и иногда не ставит маркер вовсе.
+# Сервер знает точный диапазон из filters["range"] — вычисляем детерминированно.
+# Маркер из ответа модели используется только если filters пустые (all-time).
+# ---------------------------------------------------------------------------
+def _resolve_period_from_filters(filters: dict[str, Any]) -> "DataPeriod | None":
+    range_val = str(filters.get("range") or filters.get("date_range") or "").lower()
+    days = _RANGE_MAP.get(range_val)
+    if not days:
+        return None
+    now   = datetime.now(timezone.utc)
+    from_ = (now - timedelta(days=days)).strftime("%Y-%m-%d")
+    to    = now.strftime("%Y-%m-%d")
+    label = f"last {days} days"
+    return DataPeriod(from_=from_, to=to, label=label)
+
+
+# ---------------------------------------------------------------------------
 # Reply post-processing
 # ---------------------------------------------------------------------------
 _CHART_PATTERN  = re.compile(r"<<<CHART(\{.*?\})>>>",  re.DOTALL)
