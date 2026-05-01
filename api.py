@@ -34,6 +34,15 @@ How to connect from Lovable:
         if (event.type === 'error')   showError(event.message)
       }
     })
+
+Changes vs v3:
+  - FIX #2: /sync-status now derives last_sync_at from MAX(fetched_at) in
+    CampaignContentsRaw (= actual Mailchimp pull time), not MAX(SendTime)+24h
+    which was the campaign send date — a completely different concept.
+  - FIX #3: _sse_generator no longer calls run_agent() a second time to get
+    history. Instead it reads the sentinel chunk emitted by run_agent_stream().
+  - FIX #4: /stats uses COALESCE so hook_types returns 0 (not error) when
+    EmailEnrichment is empty or not yet populated.
 """
 
 import json
@@ -55,7 +64,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Email Intelligence API", version="3.0.0")
+app = FastAPI(title="Email Intelligence API", version="4.0.0")
 
 # Allow all origins — restrict to your Lovable domain in production:
 # allow_origins=["https://your-app.lovable.app"]
@@ -243,7 +252,7 @@ def _extract_period(reply: str) -> tuple[str, DataPeriod | None]:
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok", "version": "4.0.0"}
 
 
 # ---------------------------------------------------------------------------
@@ -259,10 +268,15 @@ def get_stats():
         result = run_sql(
             """
             SELECT
-              COUNT(*)                               AS total,
-              ROUND(AVG(k.open_rate_percent), 1)     AS avg_open,
-              ROUND(AVG(k.ctr_percent), 2)           AS avg_ctr,
-              COUNT(DISTINCT e.hook_type)            AS hook_types
+              COUNT(*)                                     AS total,
+              ROUND(AVG(k.open_rate_percent), 1)           AS avg_open,
+              ROUND(AVG(k.ctr_percent), 2)                 AS avg_ctr,
+              -- FIX #4: COALESCE so hook_types = 0 when enrichment is empty,
+              -- not NULL/error. Also exclude empty-string values.
+              COUNT(DISTINCT CASE
+                WHEN e.hook_type IS NOT NULL AND e.hook_type != ''
+                THEN e.hook_type
+              END)                                         AS hook_types
             FROM `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase` k
             LEFT JOIN `x-fabric-494718-d1.datasetmailchimp.EmailEnrichment` e
               USING (campaign_id)
@@ -283,6 +297,12 @@ def get_stats():
 
 # ---------------------------------------------------------------------------
 # GET /sync-status
+#
+# FIX #2: last_sync_at now comes from MAX(fetched_at) in CampaignContentsRaw,
+# which is the actual timestamp when the Mailchimp API was last polled.
+# Previously it used MAX(SendTime) which is the campaign send date — completely
+# different. next_sync_at = last_sync_at + 24h (matches the fetch_mailchimp_content
+# schedule; adjust INTERVAL if your cron runs at a different cadence).
 # ---------------------------------------------------------------------------
 @app.get("/sync-status", response_model=SyncStatusResponse)
 def get_sync_status():
@@ -294,15 +314,17 @@ def get_sync_status():
         result = run_sql(
             """
             SELECT
-              FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', MAX(SendTime)) AS last_sync_at,
+              FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ', MAX(c.fetched_at))  AS last_sync_at,
               FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%SZ',
-                TIMESTAMP_ADD(MAX(SendTime), INTERVAL 24 HOUR))      AS next_sync_at,
-              COUNTIF(SendTime >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR))
-                AS added_24h,
-              COUNT(*) AS total,
-              FORMAT_TIMESTAMP('%Y-%m-%d', MIN(SendTime)) AS data_from,
-              FORMAT_TIMESTAMP('%Y-%m-%d', MAX(SendTime)) AS data_to
-            FROM `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase`
+                TIMESTAMP_ADD(MAX(c.fetched_at), INTERVAL 24 HOUR))       AS next_sync_at,
+              COUNTIF(k.SendTime >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR))
+                                                                           AS added_24h,
+              COUNT(DISTINCT k.campaign_id)                               AS total,
+              FORMAT_TIMESTAMP('%Y-%m-%d', MIN(k.SendTime))               AS data_from,
+              FORMAT_TIMESTAMP('%Y-%m-%d', MAX(k.SendTime))               AS data_to
+            FROM `x-fabric-494718-d1.datasetmailchimp.EmailKnowledgeBase` k
+            LEFT JOIN `x-fabric-494718-d1.datasetmailchimp.CampaignContentsRaw` c
+              USING (campaign_id)
             """,
             max_rows=1,
         )
@@ -327,7 +349,7 @@ def get_sync_status():
                 ).replace(tzinfo=timezone.utc)
                 if age > timedelta(days=7):
                     sync_status = "error"
-                    last_error  = f"Latest SendTime is {int(age.total_seconds()//3600)}h ago"
+                    last_error  = f"Latest sync is {int(age.total_seconds()//3600)}h ago"
             except ValueError:
                 pass
 
@@ -367,6 +389,10 @@ def chat(req: ChatRequest):
 # ---------------------------------------------------------------------------
 # POST /chat/stream — SSE streaming (for Lovable with fetchEventSource)
 #
+# FIX #3: history is read from the sentinel chunk emitted by run_agent_stream()
+# instead of triggering a second full run_agent() call. This saves one LLM
+# round-trip (and associated cost) per streaming request.
+#
 # Event schema:
 #   {"type":"chunk",   "text":"..."}          — streamed text token
 #   {"type":"chart",   "data":{...}}          — ChartData after stream ends
@@ -375,18 +401,30 @@ def chat(req: ChatRequest):
 #   {"type":"done"}                           — stream finished
 #   {"type":"error",   "message":"..."}       — something went wrong
 # ---------------------------------------------------------------------------
+_HISTORY_SENTINEL = "\x00HISTORY\x00"
+
+
 async def _sse_generator(req: ChatRequest) -> AsyncGenerator[str, None]:
     import asyncio
-    from agent import run_agent_stream, run_agent
+    from agent import run_agent_stream
 
-    augmented = _augment(req.message, req.filters)
+    augmented  = _augment(req.message, req.filters)
     full_reply = ""
+    history_data: list | None = None
 
     def _evt(obj: dict) -> str:
         return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
     try:
         for chunk in run_agent_stream(augmented, req.history or None):
+            # FIX #3: intercept the sentinel history chunk — never forward to client
+            if chunk.startswith(_HISTORY_SENTINEL):
+                try:
+                    history_data = json.loads(chunk[len(_HISTORY_SENTINEL):])
+                except Exception as he:
+                    log.warning("History sentinel parse error: %s", he)
+                continue
+
             full_reply += chunk
             yield _evt({"type": "chunk", "text": chunk})
             await asyncio.sleep(0)
@@ -399,14 +437,8 @@ async def _sse_generator(req: ChatRequest) -> AsyncGenerator[str, None]:
             yield _evt({"type": "chart", "data": chart.dict()})
         if period:
             yield _evt({"type": "period", "data": period.dict()})
-
-        # Return updated history (non-streaming re-run — tools are already cached
-        # by OpenAI so this is usually a single fast call)
-        try:
-            _, updated_history = run_agent(augmented, req.history or None)
-            yield _evt({"type": "history", "data": updated_history})
-        except Exception as hist_err:
-            log.warning("History re-run failed: %s", hist_err)
+        if history_data is not None:
+            yield _evt({"type": "history", "data": history_data})
 
         yield _evt({"type": "done"})
 
