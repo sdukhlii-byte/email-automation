@@ -64,7 +64,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Email Intelligence API", version="4.0.0")
+app = FastAPI(title="Email Intelligence API", version="4.1.0")
 
 # Allow all origins — restrict to your Lovable domain in production:
 # allow_origins=["https://your-app.lovable.app"]
@@ -86,12 +86,11 @@ class ChatRequest(BaseModel):
 
 
 class ChartData(BaseModel):
-    type: str        # "bar" | "line" | "pie"
+    type: str
     title: str
     data: list[dict]
     x_key: str = ""
     y_key: str = ""
-
 
 class DataPeriod(BaseModel):
     from_: str | None = None
@@ -101,7 +100,6 @@ class DataPeriod(BaseModel):
 
     class Config:
         fields = {"from_": "from"}
-
 
 class ChatResponse(BaseModel):
     reply: str
@@ -172,7 +170,54 @@ def _safe(vals: list[str], idx: int, cast=str, default=None):
 
 
 # ---------------------------------------------------------------------------
-# Filter → directive block
+# RESPONSE_STYLE system prompt
+# ---------------------------------------------------------------------------
+RESPONSE_STYLE = """You are a senior email-marketing analyst. Reply in the user's language.
+
+DEFAULT MODE = CONVERSATIONAL.
+Switch to ANALYTICAL only when the user EXPLICITLY asks for data:
+"top", "ranking", "compare", "distribution", "breakdown", "show table",
+"chart", "graph", "сколько", "топ", "сравни", "покажи таблицу", "график",
+"распределение", "по дням/неделям/месяцам", "average by ...", "list of ...".
+
+Greetings, opinions, clarifications, follow-ups, "what do you think",
+"explain why", "how does X work", "tell me about", "что думаешь", "объясни",
+"почему", "расскажи", "давай поговорим", or any message under ~6 words
+without an explicit data verb → CONVERSATIONAL, no exceptions.
+
+In CONVERSATIONAL mode it is FORBIDDEN to emit:
+  - markdown tables, bullet/numbered lists
+  - <<<CHART...>>> markers, code blocks
+Only 1–3 short sentences of plain prose.
+
+ANALYTICAL mode:
+  - One headline sentence, then ONE artifact (table OR chart, not both).
+  - Tables ≤ 10 rows, ≤ 5 columns. Charts ≤ 20 points.
+
+DATA HYGIENE — NON-NEGOTIABLE for every SQL query you generate:
+  - Always exclude warmup/seed lists:
+        AND UPPER(IFNULL(ListName,'')) NOT LIKE '%WARMY%'
+  - Always require minimum volume:
+        AND EmailsSent >= 500
+  - Treat any group with COUNT(*) < 5 as "low sample" — either skip it
+    or label it explicitly "(low sample, n=K)" in the answer.
+  - BigQuery DAYOFWEEK is 1=Sunday, 2=Monday, 3=Tuesday, 4=Wednesday,
+    5=Thursday, 6=Friday, 7=Saturday. Never invert this mapping.
+  - Hours are in UTC unless the user asks for a different timezone.
+
+PERIOD HONESTY:
+  - If the user (or filter directives) specify a period, your SQL MUST
+    contain a matching WHERE SendTime >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(),
+    INTERVAL N DAY).
+  - Do NOT invent dates. Do NOT emit a <<<PERIOD>>> marker — the server
+    fills period metadata from the actual SQL, not from your text.
+
+CHART MARKER (analytical only, optional):
+<<<CHART{"type":"bar","title":"...","data":[...],"x_key":"...","y_key":"..."}>>>
+type ∈ {"bar","line","pie"}. Exactly one chart per reply or none."""
+
+# ---------------------------------------------------------------------------
+# Range map
 # ---------------------------------------------------------------------------
 _RANGE_MAP: dict[str, int] = {
     "7d": 7,  "last_7d": 7,  "week": 7,
@@ -180,67 +225,114 @@ _RANGE_MAP: dict[str, int] = {
     "90d": 90, "quarter": 90,
 }
 
+# ---------------------------------------------------------------------------
+# Intent classifier
+# ---------------------------------------------------------------------------
+_ANALYTICAL_TRIGGERS = re.compile(
+    r"\b(top|ranking|compare|comparison|distribution|breakdown|table|chart|graph|"
+    r"average\s+by|list\s+of|how\s+many|count\s+of|"
+    r"топ|сравни|сравнение|распределени|таблиц|график|диаграмм|"
+    r"сколько|посчита|по\s+(дн|недел|месяц|кварта)|средн\w*\s+по)\b",
+    re.IGNORECASE,
+)
 
-def _build_filter_directive(filters: dict[str, Any]) -> str:
-    if not filters:
-        return ""
-    lines: list[str] = []
+def _is_conversational(message: str) -> bool:
+    msg = (message or "").strip()
+    if _ANALYTICAL_TRIGGERS.search(msg):
+        return False
+    if len(msg.split()) <= 5:
+        return True
+    return len(msg) < 80
+
+# ---------------------------------------------------------------------------
+# Prose sanitizer (safety net for conversational mode)
+# ---------------------------------------------------------------------------
+_TABLE_LINE  = re.compile(r"^\s*\|.*\|\s*$", re.MULTILINE)
+_LIST_LINE   = re.compile(r"^\s*([-*+]|\d+\.)\s+", re.MULTILINE)
+_CODE_BLOCK  = re.compile(r"```.*?```", re.DOTALL)
+_CHART_MARK  = re.compile(r"<<<CHART\{.*?\}>>>", re.DOTALL)
+_PERIOD_MARK = re.compile(r"<<<PERIOD\{.*?\}>>>", re.DOTALL)
+
+def _strip_to_prose(reply: str) -> str:
+    reply = _CODE_BLOCK.sub("", reply)
+    reply = _CHART_MARK.sub("", reply)
+    reply = _PERIOD_MARK.sub("", reply)
+    reply = _TABLE_LINE.sub("", reply)
+    reply = _LIST_LINE.sub("", reply)
+    reply = re.sub(r"\n{2,}", "\n", reply).strip()
+    sentences = re.split(r"(?<=[.!?])\s+", reply)
+    return " ".join(sentences[:3]).strip()
+
+def _drop_period_marker(reply: str) -> str:
+    return _PERIOD_MARK.sub("", reply).strip()
+
+# ---------------------------------------------------------------------------
+# Deterministic period computation
+# ---------------------------------------------------------------------------
+def _compute_period(days: int | None, rows: int | None = None) -> "DataPeriod | None":
+    if not days:
+        return None
+    now  = datetime.now(timezone.utc)
+    frm  = (now - timedelta(days=days)).date().isoformat()
+    return DataPeriod(
+        from_=frm,
+        to=now.date().isoformat(),
+        rows=rows,
+        label=f"last {days} days",
+    )
+
+# Detect when model reply mentions a timeframe (for unverified period warning)
+_PERIOD_HINT = re.compile(
+    r"(last\s+\d+\s+(day|days|week|weeks|month|months)|"
+    r"за\s+(последн\w+\s+)?(\d+\s+)?(дн|недел|месяц|кварта))",
+    re.IGNORECASE,
+)
+def _reply_mentions_period(reply: str) -> bool:
+    return bool(_PERIOD_HINT.search(reply or ""))
+
+# ---------------------------------------------------------------------------
+# Augment message with RESPONSE_STYLE + directives
+# ---------------------------------------------------------------------------
+def _augment(message: str, filters: dict[str, Any], conv: bool) -> str:
+    directives: list[str] = []
     range_val = str(filters.get("range") or filters.get("date_range") or "").lower()
     if range_val in _RANGE_MAP:
         days = _RANGE_MAP[range_val]
-        lines.append(
-            f"Restrict every SQL query: WHERE SendTime >= "
+        directives.append(
+            f"Restrict every SQL with WHERE SendTime >= "
             f"TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL {days} DAY). "
             f"Refer to this period as 'last {days} days'."
         )
     extras = {k: v for k, v in filters.items() if k not in ("range", "date_range") and v}
     if extras:
-        lines.append(
-            "Also apply these filters as SQL WHERE clauses: "
+        directives.append(
+            "Apply these filters as SQL WHERE clauses: "
             + ", ".join(f"{k}={v!r}" for k, v in extras.items())
         )
-    return "\n".join(f"- {l}" for l in lines)
-
-
-def _augment(message: str, filters: dict[str, Any]) -> str:
-    directive = _build_filter_directive(filters)
-    if not directive:
-        return message
+    directives.append(
+        "Always include: AND UPPER(IFNULL(ListName,'')) NOT LIKE '%WARMY%' "
+        "AND EmailsSent >= 500."
+    )
+    directive_block = "\n".join(f"- {d}" for d in directives)
+    mode_hint = (
+        "CURRENT MODE: CONVERSATIONAL — prose only, no tables/lists/charts."
+        if conv else
+        "CURRENT MODE: ANALYTICAL allowed if the data justifies it."
+    )
     return (
-        f"[ANALYST DIRECTIVES — apply to all SQL in this turn]\n"
-        f"{directive}\n\n"
-        f"[USER MESSAGE]\n{message}"
+        f"{RESPONSE_STYLE}\n\n{mode_hint}\n\n"
+        f"USER FILTER DIRECTIVES:\n{directive_block}\n\n"
+        f"USER MESSAGE:\n{message}"
     )
 
 
 # ---------------------------------------------------------------------------
-# Deterministic period resolution from filters
-#
-# FIX замечания 1+2: data_period больше не берётся от модели когда фильтр
-# задан явно. Модель галлюцинирует from/to и иногда не ставит маркер вовсе.
-# Сервер знает точный диапазон из filters["range"] — вычисляем детерминированно.
-# Маркер из ответа модели используется только если filters пустые (all-time).
+# Chart extraction from reply text
 # ---------------------------------------------------------------------------
-def _resolve_period_from_filters(filters: dict[str, Any]) -> "DataPeriod | None":
-    range_val = str(filters.get("range") or filters.get("date_range") or "").lower()
-    days = _RANGE_MAP.get(range_val)
-    if not days:
-        return None
-    now   = datetime.now(timezone.utc)
-    from_ = (now - timedelta(days=days)).strftime("%Y-%m-%d")
-    to    = now.strftime("%Y-%m-%d")
-    label = f"last {days} days"
-    return DataPeriod(from_=from_, to=to, label=label)
+_CHART_PATTERN = re.compile(r"<<<CHART(\{.*?\})>>>", re.DOTALL)
 
 
-# ---------------------------------------------------------------------------
-# Reply post-processing
-# ---------------------------------------------------------------------------
-_CHART_PATTERN  = re.compile(r"<<<CHART(\{.*?\})>>>",  re.DOTALL)
-_PERIOD_PATTERN = re.compile(r"<<<PERIOD(\{.*?\})>>>", re.DOTALL)
-
-
-def _extract_chart(reply: str) -> tuple[str, ChartData | None]:
+def _extract_chart(reply: str) -> tuple[str, "ChartData | None"]:
     m = _CHART_PATTERN.search(reply)
     if not m:
         return reply, None
@@ -252,27 +344,12 @@ def _extract_chart(reply: str) -> tuple[str, ChartData | None]:
         return clean, None
 
 
-def _extract_period(reply: str) -> tuple[str, DataPeriod | None]:
-    m = _PERIOD_PATTERN.search(reply)
-    if not m:
-        return reply, None
-    clean = (reply[:m.start()] + reply[m.end():]).strip()
-    try:
-        raw = json.loads(m.group(1))
-        if "from" in raw:
-            raw["from_"] = raw.pop("from")
-        return clean, DataPeriod(**raw)
-    except Exception as e:
-        log.warning("Period parse error: %s", e)
-        return clean, None
-
-
 # ---------------------------------------------------------------------------
 # GET /health
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "4.0.0"}
+    return {"status": "ok", "version": "4.1.0"}
 
 
 # ---------------------------------------------------------------------------
@@ -396,11 +473,37 @@ def get_sync_status():
 def chat(req: ChatRequest):
     try:
         from agent import run_agent
-        augmented = _augment(req.message, req.filters)
-        reply, history = run_agent(augmented, req.history or None)
-        reply, chart   = _extract_chart(reply)
-        reply, period  = _extract_period(reply)
-        return ChatResponse(reply=reply, history=history, chart=chart, data_period=period)
+
+        # Determine intent and period_days from filters
+        range_val = str((req.filters or {}).get("range") or (req.filters or {}).get("date_range") or "").lower()
+        period_days: int | None = _RANGE_MAP.get(range_val)
+
+        conv = _is_conversational(req.message)
+        augmented = _augment(req.message, req.filters or {}, conv)
+
+        reply, updated_history = run_agent(augmented, req.history or None)
+        reply, chart = _extract_chart(reply)
+        reply = _drop_period_marker(reply)   # ignore model-supplied period
+
+        # Conversational hard-strip
+        if conv:
+            reply = _strip_to_prose(reply)
+            chart = None
+
+        # Deterministic period metadata
+        period: DataPeriod | None = None
+        if period_days:
+            period = _compute_period(period_days)
+        elif not conv and _reply_mentions_period(reply):
+            # Reply claims a timeframe but no filter was set → mark unverified
+            period = DataPeriod(label="unverified", from_=None, to=None, rows=None)
+
+        return ChatResponse(
+            reply=reply,
+            history=updated_history,
+            chart=chart,
+            data_period=period,
+        )
     except Exception as e:
         log.error("Chat error: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -428,7 +531,11 @@ async def _sse_generator(req: ChatRequest) -> AsyncGenerator[str, None]:
     import asyncio
     from agent import run_agent_stream
 
-    augmented  = _augment(req.message, req.filters)
+    range_val = str((req.filters or {}).get("range") or (req.filters or {}).get("date_range") or "").lower()
+    period_days: int | None = _RANGE_MAP.get(range_val)
+
+    conv = _is_conversational(req.message)
+    augmented  = _augment(req.message, req.filters or {}, conv)
     full_reply = ""
     history_data: list | None = None
 
@@ -437,7 +544,6 @@ async def _sse_generator(req: ChatRequest) -> AsyncGenerator[str, None]:
 
     try:
         for chunk in run_agent_stream(augmented, req.history or None):
-            # FIX #3: intercept the sentinel history chunk — never forward to client
             if chunk.startswith(_HISTORY_SENTINEL):
                 try:
                     history_data = json.loads(chunk[len(_HISTORY_SENTINEL):])
@@ -449,9 +555,20 @@ async def _sse_generator(req: ChatRequest) -> AsyncGenerator[str, None]:
             yield _evt({"type": "chunk", "text": chunk})
             await asyncio.sleep(0)
 
-        # Post-process extracted metadata
-        clean, chart  = _extract_chart(full_reply)
-        clean, period = _extract_period(clean)
+        # Post-process
+        clean, chart = _extract_chart(full_reply)
+        clean = _drop_period_marker(clean)
+
+        if conv:
+            clean = _strip_to_prose(clean)
+            chart = None
+
+        # Deterministic period
+        period: DataPeriod | None = None
+        if period_days:
+            period = _compute_period(period_days)
+        elif not conv and _reply_mentions_period(clean):
+            period = DataPeriod(label="unverified", from_=None, to=None, rows=None)
 
         if chart:
             yield _evt({"type": "chart", "data": chart.dict()})
