@@ -283,7 +283,10 @@ OUTPUT RULES — read carefully
 8. ALWAYS alias tables (k, e, r) and prefix every column: k.SubjectLine, e.hook_type.
 9. Use LEFT JOIN for EmailEnrichment so NULL-enriched rows appear.
 10. NEVER add WHERE e.hook_type IS NOT NULL unless the user explicitly asks.
-
+11. STATISTICAL QUALITY GUARD — always apply to aggregations:
+    - HAVING COUNT(*) >= 10 when grouping by segment/geo/list
+    - HAVING AVG(open_rate_percent) < 80 to exclude seeded lists
+    - Label groups with 10-30 campaigns as "(low sample, n=K)"
 Output JSON only. No preamble."""
 
 
