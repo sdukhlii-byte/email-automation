@@ -118,6 +118,49 @@ Correct example queries:
 
 
 # ---------------------------------------------------------------------------
+# Mandatory filter injection
+# Injects warmup exclusion and minimum send volume into the WHERE clause
+# of every query that touches EmailKnowledgeBase, regardless of what the
+# model generated. Uses regex to find the right injection point.
+# ---------------------------------------------------------------------------
+import re as _re
+
+_FILTERS_TO_INJECT = [
+    ("WARMY",      "UPPER(IFNULL(k.ListName,'')) NOT LIKE '%WARMY%'"),
+    ("EMAILSSENT", "k.EmailsSent >= 500"),
+]
+
+def _inject_filters(query: str) -> str:
+    """Inject mandatory guards into the WHERE clause of the query."""
+    q_upper = query.upper()
+    if "EMAILKNOWLEDGEBASE" not in q_upper:
+        return query
+
+    clauses_to_add = [
+        clause for marker, clause in _FILTERS_TO_INJECT
+        if marker not in q_upper
+    ]
+    if not clauses_to_add:
+        return query
+
+    addition = " AND ".join(clauses_to_add)
+
+    # If there's already a WHERE clause, append with AND
+    where_match = _re.search(r'\bWHERE\b', query, _re.IGNORECASE)
+    if where_match:
+        insert_pos = where_match.end()
+        return query[:insert_pos] + " " + addition + " AND" + query[insert_pos:]
+    else:
+        # No WHERE — insert before GROUP BY / ORDER BY / LIMIT / HAVING, or at end
+        for keyword in ("GROUP BY", "ORDER BY", "HAVING", "LIMIT"):
+            kw_match = _re.search(r'\b' + keyword + r'\b', query, _re.IGNORECASE)
+            if kw_match:
+                pos = kw_match.start()
+                return query[:pos] + f"WHERE {addition}\n" + query[pos:]
+        return query + f"\nWHERE {addition}"
+
+
+# ---------------------------------------------------------------------------
 # SQL execution
 # ---------------------------------------------------------------------------
 def run_sql(query: str, max_rows: int = 50) -> str:
@@ -128,6 +171,8 @@ def run_sql(query: str, max_rows: int = 50) -> str:
     for keyword in ("INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "MERGE", "TRUNCATE"):
         if keyword in q:
             return f"ERROR: {keyword} statements are not allowed."
+
+    query = _inject_filters(query)
 
     try:
         client = get_bq_client()
