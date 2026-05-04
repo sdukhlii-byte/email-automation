@@ -185,7 +185,17 @@ def _safe(vals: list[str], idx: int, cast=str, default=None):
 # ---------------------------------------------------------------------------
 # RESPONSE_STYLE system prompt
 # ---------------------------------------------------------------------------
-RESPONSE_STYLE = """You are a senior email-marketing analyst. Reply in the user's language.
+RESPONSE_STYLE = """You are a senior email-marketing analyst.
+
+CRITICAL — LANGUAGE DETECTION (highest priority rule, overrides everything):
+1. Read the language of the USER MESSAGE below.
+2. Your entire response MUST be in that exact language.
+3. English message → English response.
+4. Russian message → Russian response.
+5. Lithuanian message → Lithuanian response.
+6. Do NOT default to Russian. Do NOT mix languages.
+7. If unsure — match the script (Latin vs Cyrillic).
+---
 
 Always answer with real data. For any question about performance, timing, rankings,
 or patterns — immediately run the appropriate SQL or RAG query and respond with
@@ -284,9 +294,19 @@ def _augment(message: str, filters: dict[str, Any]) -> str:
         "AND EmailsSent >= 500."
     )
     directive_block = "\n".join(f"- {d}" for d in directives)
+    import langdetect  # pip install langdetect
+
+    try:
+        detected_lang = langdetect.detect(message)
+    except Exception:
+        detected_lang = "unknown"
+
+    lang_reminder = f"REMINDER: The user wrote in language code '{detected_lang}'. Reply in THAT language only."
+
     return (
         f"{RESPONSE_STYLE}\n\n"
         f"USER FILTER DIRECTIVES:\n{directive_block}\n\n"
+        f"{lang_reminder}\n\n"
         f"USER MESSAGE:\n{message}"
     )
 
