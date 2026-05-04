@@ -141,6 +141,23 @@ class SyncStatusResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Campaign Analysis models
+# ---------------------------------------------------------------------------
+class CampaignAnalysisRequest(BaseModel):
+    campaign_id: str
+    language: str = "en"   # "en" | "ru" | "lt"
+
+
+class CampaignAnalysisResponse(BaseModel):
+    found: bool
+    campaign_id: str
+    analysis: dict | None = None       # full LLM audit JSON
+    raw_data: dict | None = None       # BQ row for supplementary display
+    benchmark: dict | None = None      # segment benchmark stats
+    error: str | None = None
+
+
+# ---------------------------------------------------------------------------
 # TTL cache (single-process; swap _val/_ts for Redis on multi-worker)
 # ---------------------------------------------------------------------------
 class _TTLCache:
@@ -625,6 +642,81 @@ async def chat_stream(req: ChatRequest):
             "X-Accel-Buffering": "no",   # tell nginx not to buffer
             "Connection":       "keep-alive",
         },
+    )
+
+
+# ---------------------------------------------------------------------------
+# POST /campaign/analyze
+#
+# Deep single-campaign audit powered by campaign_analyst.py.
+#
+# Request:
+#   { "campaign_id": "abc123", "language": "en" }
+#
+# Response: CampaignAnalysisResponse
+#   {
+#     "found": true,
+#     "campaign_id": "abc123",
+#     "analysis": { ... full LLM audit ... },
+#     "raw_data":  { ... BQ row ... },
+#     "benchmark": { ... segment stats ... },
+#     "error": null
+#   }
+#
+# Errors:
+#   404 — campaign not found in database
+#   422 — validation error (bad request body)
+#   500 — LLM or BQ failure (error field populated in body too)
+#
+# No caching intentionally — analysis is expensive and should always
+# be fresh. Add a Redis TTL cache here if you hit latency issues.
+# ---------------------------------------------------------------------------
+@app.post("/campaign/analyze", response_model=CampaignAnalysisResponse)
+def analyze_campaign_endpoint(req: CampaignAnalysisRequest):
+    """
+    Full deep audit of a single email campaign.
+
+    Runs 4 steps internally:
+      1. BQ fetch — all campaign metadata + enrichment + body excerpt
+      2. BQ benchmark — segment avg open/CTR for same list ±45 days
+      3. Qdrant RAG — 5 semantically similar peer campaigns
+      4. LLM audit — senior email marketer persona, structured JSON output
+
+    Typical latency: 8–15s (dominated by LLM call).
+    Set a 30s timeout on the client side.
+    """
+    cid = req.campaign_id.strip()
+    if not cid:
+        raise HTTPException(status_code=422, detail="campaign_id must not be empty")
+
+    log.info("POST /campaign/analyze campaign_id=%s lang=%s", cid, req.language)
+
+    try:
+        from campaign_analyst import analyze_campaign
+        result = analyze_campaign(campaign_id=cid, language=req.language)
+    except Exception as e:
+        log.error("analyze_campaign raised: %s", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+    if not result.get("found"):
+        raise HTTPException(
+            status_code=404,
+            detail=result.get("error") or f"Campaign '{cid}' not found",
+        )
+
+    # If LLM analysis itself failed (found=True but analysis=None), still
+    # return 200 with error field populated so the frontend can show
+    # the raw_data section even without the AI audit.
+    if result.get("found") and result.get("analysis") is None and result.get("error"):
+        log.warning("Campaign found but LLM audit failed: %s", result["error"])
+
+    return CampaignAnalysisResponse(
+        found=result["found"],
+        campaign_id=result["campaign_id"],
+        analysis=result.get("analysis"),
+        raw_data=result.get("raw_data"),
+        benchmark=result.get("benchmark"),
+        error=result.get("error"),
     )
 
 
